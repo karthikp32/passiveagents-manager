@@ -1,0 +1,9 @@
+.codex
+
+/passiveagents
+/passiveagents-manager
+/cmd/passiveagents/passiveagents
+
+*.test
+coverage.out
+.DS_Store
