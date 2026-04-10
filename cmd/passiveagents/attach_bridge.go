@@ -29,9 +29,9 @@ func normalizeRelayErr(err error) error {
 	}
 }
 
-// HijackAttach connects local terminal stdin/stdout to a running manager attach socket.
+// AttachInteractive connects local terminal stdin/stdout to a running manager attach socket.
 // It enters raw mode to preserve TUI behavior and special key sequences.
-func HijackAttach(addr string) error {
+func AttachInteractive(addr string) error {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("dial attach bridge: %w", err)

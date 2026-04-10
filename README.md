@@ -37,6 +37,7 @@ The current source tree is Unix-only. The main Go files use `//go:build unix`, s
 cmd/passiveagents/
   main.go              CLI and manager runtime
   service.go           launchd/systemd/task setup helpers
+  attach_bridge.go     interactive terminal attach/PTY bridge helpers
   realtime.go          websocket/browser streaming support
   vt_state.go          terminal replay and screen state helpers
   *_test.go            focused unit and subprocess coverage
@@ -101,3 +102,4 @@ The current CLI includes commands for:
 - Generated binaries and local editor/tooling artifacts are not part of source control.
 - If you are reviewing service install behavior, start with [cmd/passiveagents/service.go](cmd/passiveagents/service.go).
 - If you are reviewing task execution and streaming behavior, start with [cmd/passiveagents/main.go](cmd/passiveagents/main.go) and [cmd/passiveagents/realtime.go](cmd/passiveagents/realtime.go).
+- If you are reviewing local interactive attach behavior, start with [cmd/passiveagents/attach_bridge.go](cmd/passiveagents/attach_bridge.go).

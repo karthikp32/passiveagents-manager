@@ -7840,7 +7840,7 @@ func (m *manager) chatWithInstance(ctx context.Context, instanceID string) error
 	if err != nil {
 		return err
 	}
-	return HijackAttach(attachAddr)
+	return AttachInteractive(attachAddr)
 }
 
 func (m *manager) resolveAttachAddress(instanceID string) (string, error) {
