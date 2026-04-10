@@ -99,5 +99,5 @@ The current CLI includes commands for:
 
 - This repo is intended to expose the local manager implementation cleanly.
 - Generated binaries and local editor/tooling artifacts are not part of source control.
-- If you are reviewing service install behavior, start with [cmd/passiveagents/service.go](/home/karthik/repos/passiveagents-manager/cmd/passiveagents/service.go).
-- If you are reviewing task execution and streaming behavior, start with [cmd/passiveagents/main.go](/home/karthik/repos/passiveagents-manager/cmd/passiveagents/main.go) and [cmd/passiveagents/realtime.go](/home/karthik/repos/passiveagents-manager/cmd/passiveagents/realtime.go).
+- If you are reviewing service install behavior, start with [cmd/passiveagents/service.go](cmd/passiveagents/service.go).
+- If you are reviewing task execution and streaming behavior, start with [cmd/passiveagents/main.go](cmd/passiveagents/main.go) and [cmd/passiveagents/realtime.go](cmd/passiveagents/realtime.go).
