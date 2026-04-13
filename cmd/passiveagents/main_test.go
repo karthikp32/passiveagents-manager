@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1276,6 +1277,7 @@ func TestScanLifecycleMarkersDefersCompletedAndLetsNeedsInputWin(t *testing.T) {
 	w := &worker{
 		instanceID:   "instance-1",
 		agentID:      "agent-1",
+		taskID:       "task-1",
 		outputBuffer: &outputRingBuffer{maxSize: 4096},
 	}
 
@@ -1297,6 +1299,9 @@ func TestScanLifecycleMarkersDefersCompletedAndLetsNeedsInputWin(t *testing.T) {
 	}
 	if got := updates[0]["comment"]; got != "Need approval to continue." {
 		t.Fatalf("unexpected waiting comment: %#v", got)
+	}
+	if got := updates[0]["taskId"]; got != "task-1" {
+		t.Fatalf("expected lifecycle update task id %#v, got %#v", "task-1", got)
 	}
 	if strings.TrimSpace(w.pendingTaskCompleted) != "" {
 		t.Fatalf("expected pending completed marker to be cleared, got %q", w.pendingTaskCompleted)
@@ -1334,6 +1339,7 @@ func TestFlushPendingTaskCompletedPostsSanitizedSummaryAfterGracePeriod(t *testi
 	w := &worker{
 		instanceID:             "instance-1",
 		agentID:                "",
+		taskID:                 "task-1",
 		pendingTaskCompleted:   cleanLifecycleComment("[38;5;153m│[39m", "Task completed (no summary)."),
 		pendingTaskCompletedAt: time.Now().Add(-taskCompletedGrace - 50*time.Millisecond),
 	}
@@ -1347,6 +1353,9 @@ func TestFlushPendingTaskCompletedPostsSanitizedSummaryAfterGracePeriod(t *testi
 	}
 	if got := updates[0]["comment"]; got != "Task completed (no summary)." {
 		t.Fatalf("unexpected completed comment: %#v", got)
+	}
+	if got := updates[0]["taskId"]; got != "task-1" {
+		t.Fatalf("expected completed update task id %#v, got %#v", "task-1", got)
 	}
 }
 
@@ -1441,6 +1450,79 @@ func TestRegisterManagerIncludesReleaseMetadata(t *testing.T) {
 	}
 }
 
+func TestDetectInstalledCodingAgentProvidersReturnsInstalledProviders(t *testing.T) {
+	previousVersionCheck := codingAgentVersionCheck
+	codingAgentVersionCheck = func(command string) error {
+		switch command {
+		case "codex", "gemini":
+			return nil
+		default:
+			return exec.ErrNotFound
+		}
+	}
+	t.Cleanup(func() {
+		codingAgentVersionCheck = previousVersionCheck
+	})
+
+	got := installedCodingAgentProviders()
+	want := []string{"CODEX", "GEMINI_CLI"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("installedCodingAgentProviders() = %v, want %v", got, want)
+	}
+}
+
+func TestRegisterManagerIncludesInstalledCodingAgentProviders(t *testing.T) {
+	previousVersionCheck := codingAgentVersionCheck
+	codingAgentVersionCheck = func(command string) error {
+		switch command {
+		case "claude", "opencode":
+			return nil
+		default:
+			return exec.ErrNotFound
+		}
+	}
+	t.Cleanup(func() {
+		codingAgentVersionCheck = previousVersionCheck
+	})
+
+	tempDir := t.TempDir()
+	m, err := newManager(config{
+		APIBaseURL:        "http://local.test",
+		UserJWT:           "user-jwt",
+		MachineName:       "regression-box",
+		ExecutionMode:     "LOCAL",
+		MaxConcurrent:     1,
+		StateFile:         filepath.Join(tempDir, "manager-state.json"),
+		HeartbeatInterval: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+
+	var captured map[string]any
+	m.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/local-agent-managers/register" {
+			return nil, fmt.Errorf("unexpected request path %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			return nil, err
+		}
+		return jsonHTTPResponse(200, `{"machineId":"manager-1"}`), nil
+	})}
+
+	if err := m.registerManager(context.Background()); err != nil {
+		t.Fatalf("registerManager error: %v", err)
+	}
+
+	got, ok := captured["installedCodingAgentProviders"].([]any)
+	if !ok {
+		t.Fatalf("expected installedCodingAgentProviders array, got %#v", captured["installedCodingAgentProviders"])
+	}
+	if !reflect.DeepEqual(got, []any{"CLAUDE_CODE", "OPENCODE"}) {
+		t.Fatalf("installedCodingAgentProviders = %v, want %v", got, []any{"CLAUDE_CODE", "OPENCODE"})
+	}
+}
+
 func TestRegisterManagerIncludesStoredRefreshToken(t *testing.T) {
 	originalKeyringSet := keyringSet
 	originalKeyringGet := keyringGet
@@ -1509,6 +1591,8 @@ func TestRegisterManagerIncludesStoredRefreshToken(t *testing.T) {
 }
 
 func TestRegisterManagerSkipsWhenManagerIDAndTunnelTokenAlreadyExist(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
 	originalKeyringGet := keyringGet
 	keyringGet = func(service, user string) (string, error) {
 		if user == keyringRecoveryTokenUser {
@@ -1539,6 +1623,84 @@ func TestRegisterManagerSkipsWhenManagerIDAndTunnelTokenAlreadyExist(t *testing.
 
 	if err := m.registerManager(context.Background()); err != nil {
 		t.Fatalf("registerManager error: %v", err)
+	}
+}
+
+func TestRegisterManagerSyncsStoredSessionWhenAlreadyRegistered(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	originalKeyringGet := keyringGet
+	originalKeyringSet := keyringSet
+	var sessionInKeyring string
+	keyringGet = func(service, user string) (string, error) {
+		switch user {
+		case keyringRecoveryTokenUser:
+			return "recovery-token", nil
+		case keyringUser:
+			if sessionInKeyring != "" {
+				return sessionInKeyring, nil
+			}
+		}
+		return "", errors.New("secret not found in keyring")
+	}
+	keyringSet = func(service, user, value string) error {
+		if user == keyringUser {
+			sessionInKeyring = value
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		keyringGet = originalKeyringGet
+		keyringSet = originalKeyringSet
+	})
+
+	tempDir := t.TempDir()
+	m, err := newManager(config{
+		APIBaseURL:  "http://local.test",
+		MachineName: "existing-box",
+		StateFile:   filepath.Join(tempDir, "manager-state.json"),
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	if err := m.saveSession(storedSession{
+		AccessToken:  "access-token",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+		UserID:       "user-1",
+	}); err != nil {
+		t.Fatalf("saveSession error: %v", err)
+	}
+
+	m.state.ManagerID = "manager-existing"
+	m.state.TunnelToken = "token-existing"
+	syncCalls := 0
+	m.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/local-agent-managers/manager-existing/session" {
+			t.Fatalf("unexpected request to %s", r.URL.Path)
+		}
+		if r.Method != http.MethodPost {
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer access-token" {
+			t.Fatalf("unexpected authorization header %q", got)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if got := payload["refreshToken"]; got != "refresh-token" {
+			t.Fatalf("unexpected refreshToken %#v", got)
+		}
+		syncCalls++
+		return jsonHTTPResponse(200, `{"ok":true}`), nil
+	})}
+
+	if err := m.registerManager(context.Background()); err != nil {
+		t.Fatalf("registerManager error: %v", err)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("expected one session sync call, got %d", syncCalls)
 	}
 }
 
@@ -2749,6 +2911,8 @@ func TestHandleBrowserWakeInstanceIgnoresCanceledRequestContext(t *testing.T) {
 			return testJSONResponse(t, http.StatusOK, map[string]any{
 				"claimed": true,
 			}), nil
+		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/instance-1/update-task":
+			return testJSONResponse(t, http.StatusOK, map[string]any{"ok": true}), nil
 		default:
 			return testJSONResponse(t, http.StatusNotFound, map[string]any{
 				"error": fmt.Sprintf("unexpected path %s", r.URL.Path),
@@ -3424,6 +3588,127 @@ func TestGetFreshStoredSessionRecoversManagerSessionFromPersistedRecoveryToken(t
 	}
 }
 
+func TestGetFreshStoredSessionReregistersManagerWhenStoredRecoveryTokenIsInvalid(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	var keyringValue string
+	var recoveryTokenInKeyring string
+	origSet := keyringSet
+	origGet := keyringGet
+	keyringSet = func(service, user, value string) error {
+		if user == keyringRecoveryTokenUser {
+			recoveryTokenInKeyring = value
+			return nil
+		}
+		keyringValue = value
+		return nil
+	}
+	keyringGet = func(service, user string) (string, error) {
+		if user == keyringRecoveryTokenUser {
+			if recoveryTokenInKeyring == "" {
+				return "", fmt.Errorf("missing recovery token")
+			}
+			return recoveryTokenInKeyring, nil
+		}
+		if keyringValue == "" {
+			return "", fmt.Errorf("missing session")
+		}
+		return keyringValue, nil
+	}
+	t.Cleanup(func() {
+		keyringSet = origSet
+		keyringGet = origGet
+	})
+
+	sessionSeed := storedSession{
+		AccessToken:  "still-valid-access",
+		RefreshToken: "stale-refresh",
+		ExpiresAt:    time.Now().Add(2 * time.Minute).Unix(),
+		UserID:       "user-1",
+	}
+	sessionRaw, err := json.Marshal(sessionSeed)
+	if err != nil {
+		t.Fatalf("marshal session seed: %v", err)
+	}
+	if err := keyringSet(keyringService, keyringUser, string(sessionRaw)); err != nil {
+		t.Fatalf("seed keyring session: %v", err)
+	}
+	if err := keyringSet(keyringService, keyringRecoveryTokenUser, "stale-recovery-token"); err != nil {
+		t.Fatalf("seed keyring recovery token: %v", err)
+	}
+	if err := writeFallbackSession(sessionRaw); err != nil {
+		t.Fatalf("seed fallback session: %v", err)
+	}
+
+	recoveryCalls := 0
+	registerCalls := 0
+	mgr := &manager{
+		cfg: config{
+			APIBaseURL:    "http://local.test",
+			MachineName:   "regression-box",
+			ExecutionMode: "LOCAL",
+			MaxConcurrent: 1,
+			StateFile:     filepath.Join(tempHome, "manager-state.json"),
+		},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch r.URL.Path {
+			case "/local-agent-managers/manager-1/session/recover":
+				recoveryCalls++
+				switch got := r.Header.Get("Authorization"); got {
+				case "Bearer stale-recovery-token":
+					return jsonHTTPResponse(400, `{"message":"Stored manager session is invalid","error":"Bad Request","statusCode":400}`), nil
+				case "Bearer fresh-recovery-token":
+					return jsonHTTPResponse(200, `{"accessToken":"new-access","refreshToken":"new-refresh","expiresAt":4102444800,"userId":"user-1"}`), nil
+				default:
+					t.Fatalf("unexpected authorization header: %q", got)
+				}
+			case "/local-agent-managers/register":
+				registerCalls++
+				if got := r.Header.Get("Authorization"); got != "Bearer still-valid-access" {
+					t.Fatalf("unexpected registration authorization header: %q", got)
+				}
+				var payload map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Fatalf("decode register payload: %v", err)
+				}
+				if got := payload["refreshToken"]; got != "stale-refresh" {
+					t.Fatalf("expected refreshToken stale-refresh, got %#v", got)
+				}
+				return jsonHTTPResponse(200, `{"machineId":"manager-1","tunnelToken":"token-1","managerRecoveryToken":"fresh-recovery-token"}`), nil
+			default:
+				t.Fatalf("unexpected path: %s", r.URL.Path)
+				return nil, nil
+			}
+			return nil, nil
+		})},
+		state: persistedState{
+			ManagerID:   "manager-1",
+			TunnelToken: "token-1",
+		},
+	}
+	mgr.refreshSessionHook = func(ctx context.Context, refreshToken string) (storedSession, error) {
+		return storedSession{}, fmt.Errorf("refresh session failed: refresh_token_already_used")
+	}
+
+	session, err := mgr.getFreshStoredSession(context.Background(), false)
+	if err != nil {
+		t.Fatalf("getFreshStoredSession error: %v", err)
+	}
+	if registerCalls != 1 {
+		t.Fatalf("expected one registration retry, got %d", registerCalls)
+	}
+	if recoveryCalls != 2 {
+		t.Fatalf("expected two recovery attempts, got %d", recoveryCalls)
+	}
+	if recoveryTokenInKeyring != "fresh-recovery-token" {
+		t.Fatalf("expected refreshed recovery token in keyring, got %q", recoveryTokenInKeyring)
+	}
+	if session.AccessToken != "new-access" || session.RefreshToken != "new-refresh" {
+		t.Fatalf("expected recovered session, got %#v", session)
+	}
+}
+
 func TestManagerRequestJSONWrapsInvalidRefreshTokenErrorWhenRecoveryUnavailable(t *testing.T) {
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
@@ -3487,6 +3772,40 @@ func TestManagerRequestJSONWrapsInvalidRefreshTokenErrorWhenRecoveryUnavailable(
 	}
 	if got := err.Error(); got != "refresh session failed: refresh token invalid or already used; run 'passiveagents login'" {
 		t.Fatalf("expected wrapped refresh error, got %q", got)
+	}
+}
+
+func TestCleanCLIErrorPromptsLoginAgainForUnrecoverableAuthFailures(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "wrapped refresh token failure",
+			err:  fmt.Errorf("refresh session failed: refresh token invalid or already used; run 'passiveagents login'"),
+		},
+		{
+			name: "missing stored session",
+			err:  fmt.Errorf("no stored session; run 'passiveagents login' first"),
+		},
+		{
+			name: "missing refresh token",
+			err:  fmt.Errorf("missing refresh token; run login again"),
+		},
+		{
+			name: "missing recovery configuration",
+			err:  missingRecoveryTokenInstructionError(),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := cleanCLIError(tc.err)
+			want := "Please login again by running 'passiveagents login'."
+			if got != want {
+				t.Fatalf("cleanCLIError() = %q, want %q", got, want)
+			}
+		})
 	}
 }
 
@@ -4519,7 +4838,7 @@ func TestReconcileLocalStateKeepsRunningInstancesFromPreviousManager(t *testing.
 			},
 		},
 		previousManagerPID: os.Getpid() + 1,
-		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		logger:             slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
 	}
 	if err := writeState(statePath, mgr.state); err != nil {
 		t.Fatalf("write state: %v", err)
@@ -5588,7 +5907,7 @@ func TestMonitorWorkerExitPreservesRestartableStateForManagerStop(t *testing.T) 
 				},
 			},
 		},
-		logger:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+		logger:                slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
 		instanceSpawnLocks:    map[string]*sync.Mutex{"instance-1": &sync.Mutex{}},
 		browserPreferredSizes: map[string]terminalSize{"instance-1": {cols: 120, rows: 40}},
 	}
@@ -5930,6 +6249,191 @@ func TestSpawnWorkerLeavesTaskReadyWhenAgentClaimFails(t *testing.T) {
 	}
 	if !claimAttempted {
 		t.Fatalf("expected agent claim attempt")
+	}
+}
+
+func TestSpawnWorkerPersistsTaskWorkingDirectoryImmediatelyAfterClaim(t *testing.T) {
+	claimAttempted := false
+	persistedWorkingDir := ""
+	sawClaimStatePersist := false
+	persistedTaskID := ""
+	persistedCurrentTaskID := ""
+	persistedAssignedInstanceID := ""
+	persistedManagerID := ""
+	tempDir := t.TempDir()
+	var logBuf bytes.Buffer
+
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/register":
+			return jsonHTTPResponse(200, `{"id":"instance-1"}`), nil
+		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/instance-1/claim-task":
+			claimAttempted = true
+			return jsonHTTPResponse(200, `{"claimed":true}`), nil
+		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/instance-1/update-task":
+			var payload struct {
+				TaskID                  string `json:"taskId"`
+				CurrentTaskID           string `json:"currentTaskId"`
+				AssignedAgentInstanceID string `json:"assignedAgentInstanceId"`
+				LocalAgentManagerID     string `json:"localAgentManagerId"`
+				WorkingDirectory        string `json:"workingDirectory"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode update-task payload: %v", err)
+			}
+			persistedTaskID = payload.TaskID
+			persistedCurrentTaskID = payload.CurrentTaskID
+			persistedAssignedInstanceID = payload.AssignedAgentInstanceID
+			persistedManagerID = payload.LocalAgentManagerID
+			persistedWorkingDir = payload.WorkingDirectory
+			sawClaimStatePersist = true
+			return jsonHTTPResponse(200, `{}`), nil
+		default:
+			return jsonHTTPResponse(404, `{"error":"not found"}`), nil
+		}
+	})
+
+	m, err := newManager(config{
+		WebBaseURL:        "http://localhost:3000",
+		APIBaseURL:        "http://local.test",
+		UserJWT:           "user-jwt",
+		MaxConcurrent:     1,
+		StateFile:         filepath.Join(tempDir, "manager-state.json"),
+		CPUThreshold:      80,
+		SystemReserveMB:   1024,
+		MBPerAgent:        1024,
+		LogFlushInterval:  10 * time.Millisecond,
+		LogFlushBatchSize: 1,
+		LessonsBaseDir:    filepath.Join(tempDir, "agents"),
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	m.client = &http.Client{Transport: transport}
+	m.logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+	m.state.ManagerID = "manager-1"
+
+	err = m.spawnWorkerWithWorkingDir(
+		context.Background(),
+		apiAgentPersona{
+			ID:        "550e8400-e29b-41d4-a716-446655440020",
+			RuntimeID: "runtime-1",
+			AgentRuntime: struct {
+				Provider        string `json:"provider"`
+				CommandTemplate string `json:"command_template"`
+			}{
+				CommandTemplate: "printf 'hello\\n'",
+			},
+		},
+		apiTask{ID: "task-1", Name: "Queued task"},
+		1,
+		"",
+		tempDir,
+	)
+	if !claimAttempted {
+		t.Fatalf("expected agent claim attempt")
+	}
+	if !sawClaimStatePersist {
+		t.Fatalf("expected a claim-state persistence call")
+	}
+	if persistedTaskID != "task-1" {
+		t.Fatalf("expected persisted task id %q, got %q", "task-1", persistedTaskID)
+	}
+	if persistedCurrentTaskID != "task-1" {
+		t.Fatalf("expected persisted current task id %q, got %q", "task-1", persistedCurrentTaskID)
+	}
+	if persistedAssignedInstanceID != "instance-1" {
+		t.Fatalf("expected persisted assigned instance id %q, got %q", "instance-1", persistedAssignedInstanceID)
+	}
+	if persistedManagerID != "manager-1" {
+		t.Fatalf("expected persisted manager id %q, got %q", "manager-1", persistedManagerID)
+	}
+	if persistedWorkingDir != tempDir {
+		t.Fatalf("expected persisted working directory %q, got %q", tempDir, persistedWorkingDir)
+	}
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "task_claim_state_persisted") {
+		t.Fatalf("expected success log for claim-state persistence, got %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "working_dir="+tempDir) {
+		t.Fatalf("expected success log to include working directory %q, got %q", tempDir, logOutput)
+	}
+	if !strings.Contains(logOutput, "manager_id=manager-1") {
+		t.Fatalf("expected success log to include manager id, got %q", logOutput)
+	}
+	if err == nil {
+		t.Fatalf("expected the test worker to fail later in startup so the test stays scoped to working-directory persistence")
+	}
+}
+
+func TestSpawnWorkerLogsTaskWorkingDirectoryPersistenceFailure(t *testing.T) {
+	claimAttempted := false
+	tempDir := t.TempDir()
+	var logBuf bytes.Buffer
+
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/register":
+			return jsonHTTPResponse(200, `{"id":"instance-1"}`), nil
+		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/instance-1/claim-task":
+			claimAttempted = true
+			return jsonHTTPResponse(200, `{"claimed":true}`), nil
+		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/instance-1/update-task":
+			return jsonHTTPResponse(400, `{"message":"Unable to update task"}`), nil
+		default:
+			return jsonHTTPResponse(404, `{"error":"not found"}`), nil
+		}
+	})
+
+	m, err := newManager(config{
+		WebBaseURL:        "http://localhost:3000",
+		APIBaseURL:        "http://local.test",
+		UserJWT:           "user-jwt",
+		MaxConcurrent:     1,
+		StateFile:         filepath.Join(tempDir, "manager-state.json"),
+		CPUThreshold:      80,
+		SystemReserveMB:   1024,
+		MBPerAgent:        1024,
+		LogFlushInterval:  10 * time.Millisecond,
+		LogFlushBatchSize: 1,
+		LessonsBaseDir:    filepath.Join(tempDir, "agents"),
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	m.client = &http.Client{Transport: transport}
+	m.logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+	m.state.ManagerID = "manager-1"
+
+	err = m.spawnWorkerWithWorkingDir(
+		context.Background(),
+		apiAgentPersona{
+			ID:        "550e8400-e29b-41d4-a716-446655440020",
+			RuntimeID: "runtime-1",
+			AgentRuntime: struct {
+				Provider        string `json:"provider"`
+				CommandTemplate string `json:"command_template"`
+			}{
+				CommandTemplate: "printf 'hello\\n'",
+			},
+		},
+		apiTask{ID: "task-1", Name: "Queued task"},
+		1,
+		"",
+		tempDir,
+	)
+	if !claimAttempted {
+		t.Fatalf("expected agent claim attempt")
+	}
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "task_claim_state_persist_failed") {
+		t.Fatalf("expected failure log for claim-state persistence, got %q", logOutput)
+	}
+	if strings.Contains(logOutput, "task_claim_state_persisted") {
+		t.Fatalf("did not expect success log when persistence failed, got %q", logOutput)
+	}
+	if err == nil {
+		t.Fatalf("expected the test worker to fail later in startup so the test stays scoped to working-directory persistence logging")
 	}
 }
 

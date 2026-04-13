@@ -35,6 +35,7 @@ type allowedFolder struct {
 	DisplayPath  string `json:"display_path"`
 	AbsolutePath string `json:"absolute_path"`
 	IsGitRepo    bool   `json:"is_git_repo"`
+	CreatedAt    string `json:"created_at"`
 }
 
 type apiManagerFolderRecord struct {
@@ -43,6 +44,7 @@ type apiManagerFolderRecord struct {
 	DisplayPath         string `json:"display_path"`
 	IsGitRepo           bool   `json:"is_git_repo"`
 	LocalAgentManagerID string `json:"local_agent_manager_id"`
+	CreatedAt           string `json:"created_at"`
 }
 
 func (m *manager) listAllowedFolders(out io.Writer) error {
@@ -324,6 +326,7 @@ func buildAllowedFolderFromRecord(record apiManagerFolderRecord) (allowedFolder,
 		DisplayPath:  displayPathForHome(canonicalPath),
 		AbsolutePath: canonicalPath,
 		IsGitRepo:    isGitRepo,
+		CreatedAt:    record.CreatedAt,
 	}, nil
 }
 
@@ -365,6 +368,7 @@ func buildAllowedFolder(inputPath, label string) (allowedFolder, error) {
 		DisplayPath:  displayPathForHome(canonicalPath),
 		AbsolutePath: canonicalPath,
 		IsGitRepo:    isGitRepo,
+		CreatedAt:    "",
 	}, nil
 }
 

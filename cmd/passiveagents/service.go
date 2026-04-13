@@ -56,6 +56,9 @@ type managerServiceArtifacts struct {
 }
 
 func startManagerProcess(cfg config) error {
+	if !strings.EqualFold(strings.TrimSpace(cfg.ExecutionMode), "CLOUD") && len(detectInstalledCodingAgentProviders()) == 0 {
+		return fmt.Errorf("passiveagents requires at least one coding agent to be installed before start. Install Codex, Claude Code, Gemini CLI, or OpenCode and try again")
+	}
 	if pid, err := serviceReadManagerPIDFromState(cfg.StateFile); err == nil && serviceIsProcessRunning(pid) {
 		return fmt.Errorf("passiveagents is already running (PID %d). Run 'passiveagents status' for details", pid)
 	}

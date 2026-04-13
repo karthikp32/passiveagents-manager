@@ -200,6 +200,48 @@ func TestStartManagerProcessReturnsBeforePersistingStateWhenManagerAlreadyRunnin
 	}
 }
 
+func TestStartManagerProcessSkipsLocalCodingAgentGateForCloudExecutionMode(t *testing.T) {
+	restore := stubServiceGlobals(t)
+	defer restore()
+
+	versionChecks := 0
+	codingAgentVersionCheck = func(string) error {
+		versionChecks++
+		return exec.ErrNotFound
+	}
+
+	tempHome := t.TempDir()
+	tempRoot := filepath.Join(tempHome, "tmp")
+	serviceCurrentGOOS = func() string { return "linux" }
+	serviceUserHomeDir = func() (string, error) { return tempHome, nil }
+	serviceExecutable = func() (string, error) {
+		return filepath.Join(tempRoot, "go-build1234", "b001", "exe", "passiveagents"), nil
+	}
+	serviceLookupPath = func(name string) (string, error) { return "/usr/bin/cloudflared", nil }
+	serviceReadManagerPIDFromState = func(string) (int, error) { return 0, os.ErrNotExist }
+	t.Setenv("TMPDIR", tempRoot)
+
+	err := startManagerProcess(config{
+		StateFile:       filepath.Join(tempHome, "state.json"),
+		WebBaseURL:      "https://passiveagents.com",
+		APIBaseURL:      "https://api.passiveagents.com",
+		ExecutionMode:   "CLOUD",
+		ManagerLogFile:  filepath.Join(tempHome, ".passiveagents", "manager.log"),
+		LessonsBaseDir:  filepath.Join(tempHome, ".passiveagents", "lessons"),
+		SupabaseURL:     "https://supabase.passiveagents.com",
+		SupabaseAnonKey: "anon",
+	})
+	if err == nil {
+		t.Fatal("expected service artifact build to fail")
+	}
+	if strings.Contains(err.Error(), "at least one coding agent") {
+		t.Fatalf("expected cloud execution mode to skip local coding agent gate, got %v", err)
+	}
+	if versionChecks != 0 {
+		t.Fatalf("expected no local coding agent version checks in cloud mode, got %d", versionChecks)
+	}
+}
+
 func TestStartManagerProcessDoesNotPersistStateWhenServiceArtifactsFail(t *testing.T) {
 	restore := stubServiceGlobals(t)
 	defer restore()
@@ -401,6 +443,33 @@ func TestStartManagerProcessFallsBackToUserLaunchdDomain(t *testing.T) {
 	}
 }
 
+func TestStartManagerProcessBlocksWhenNoCodingAgentInstalled(t *testing.T) {
+	restore := stubServiceGlobals(t)
+	defer restore()
+
+	previousVersionCheck := codingAgentVersionCheck
+	codingAgentVersionCheck = func(string) error {
+		return exec.ErrNotFound
+	}
+	t.Cleanup(func() {
+		codingAgentVersionCheck = previousVersionCheck
+	})
+
+	tempHome := t.TempDir()
+	err := startManagerProcess(config{
+		StateFile:      filepath.Join(tempHome, "state.json"),
+		WebBaseURL:     "https://passiveagents.com",
+		APIBaseURL:     "https://api.passiveagents.com",
+		ManagerLogFile: filepath.Join(tempHome, ".passiveagents", "manager.log"),
+	})
+	if err == nil {
+		t.Fatal("expected missing coding agent error")
+	}
+	if !strings.Contains(err.Error(), "at least one coding agent") {
+		t.Fatalf("expected coding agent guidance, got %v", err)
+	}
+}
+
 func TestInstallLaunchdServiceBootsOutGuiTargetBeforeUserFallbackAfterKickstartFailure(t *testing.T) {
 	restore := stubServiceGlobals(t)
 	defer restore()
@@ -408,9 +477,9 @@ func TestInstallLaunchdServiceBootsOutGuiTargetBeforeUserFallbackAfterKickstartF
 	tempHome := t.TempDir()
 	servicePath := filepath.Join(tempHome, "Library", "LaunchAgents", managerLaunchdLabel+".plist")
 	artifacts := managerServiceArtifacts{
-		supervisor:      "launchd",
-		servicePath:     servicePath,
-		launchdTargets:  []string{"gui/501", "user/501"},
+		supervisor:     "launchd",
+		servicePath:    servicePath,
+		launchdTargets: []string{"gui/501", "user/501"},
 	}
 
 	var commands []string
@@ -496,6 +565,7 @@ func stubServiceGlobals(t *testing.T) func() {
 	prevIsProcessRunning := serviceIsProcessRunning
 	prevFindProcess := serviceFindProcess
 	prevRunServiceCommand := runServiceCommand
+	prevVersionCheck := codingAgentVersionCheck
 	return func() {
 		serviceCurrentGOOS = prevGOOS
 		serviceExecutable = prevExecutable
@@ -507,5 +577,6 @@ func stubServiceGlobals(t *testing.T) func() {
 		serviceIsProcessRunning = prevIsProcessRunning
 		serviceFindProcess = prevFindProcess
 		runServiceCommand = prevRunServiceCommand
+		codingAgentVersionCheck = prevVersionCheck
 	}
 }

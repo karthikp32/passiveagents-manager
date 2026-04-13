@@ -34,6 +34,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"testing"
 	"text/tabwriter"
 	"time"
 
@@ -71,8 +72,16 @@ var (
 	shutdownKillRetryBaseDelay = 250 * time.Millisecond
 	shutdownKillRetryMaxDelay  = 2 * time.Second
 	cmdStart                   = func(cmd *exec.Cmd) error { return cmd.Start() }
-	killManagedPIDFunc         = killManagedPID
-	managerRuntimeGOOS         = func() string { return runtime.GOOS }
+	codingAgentVersionCheck    = func(command string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, command, "--version")
+		cmd.Stdout = io.Discard
+		cmd.Stderr = io.Discard
+		return cmd.Run()
+	}
+	killManagedPIDFunc = killManagedPID
+	managerRuntimeGOOS = func() string { return runtime.GOOS }
 )
 
 const (
@@ -96,12 +105,14 @@ const (
 
 var refreshTokenMessagePrinted bool
 
+const loginAgainCLIMessage = "Please login again by running 'passiveagents login'."
+
 func printRefreshTokenMessage() {
 	if refreshTokenMessagePrinted {
 		return
 	}
 	refreshTokenMessagePrinted = true
-	fmt.Println("Refresh token invalid or already used. Run 'passiveagents login'.")
+	fmt.Println(loginAgainCLIMessage)
 }
 
 func missingRecoveryTokenInstructionError() error {
@@ -573,6 +584,7 @@ type apiTask struct {
 	SelectedFolderID string   `json:"selected_folder_id"`
 	Status           string   `json:"status"`
 	AssignedInstance string   `json:"assigned_agent_instance_id"`
+	WorkingDirectory string   `json:"working_directory"`
 }
 
 type apiTaskCheckpoint struct {
@@ -1098,7 +1110,12 @@ func newManager(cfg config) (*manager, error) {
 		state:  state,
 		client: &http.Client{Timeout: 20 * time.Second},
 		logger: slog.New(
-			slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}),
+			slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: func() slog.Level {
+				if testing.Testing() {
+					return slog.LevelError
+				}
+				return slog.LevelInfo
+			}()}),
 		),
 		pollNow:               make(chan struct{}, 1),
 		workers:               map[string]*worker{},
@@ -3163,6 +3180,13 @@ func (m *manager) registerManager(ctx context.Context) error {
 	if strings.TrimSpace(m.state.ManagerID) != "" &&
 		strings.TrimSpace(m.state.TunnelToken) != "" &&
 		strings.TrimSpace(loadManagerRecoveryToken(m.state)) != "" {
+		if err := m.syncRegisteredManagerSession(ctx); err != nil {
+			m.logWarn(
+				"manager_session_sync_failed manager_id=%s err=%v",
+				strings.TrimSpace(m.state.ManagerID),
+				err,
+			)
+		}
 		m.logInfo("manager_already_registered manager_id=%s", m.state.ManagerID)
 		return nil
 	}
@@ -3179,14 +3203,43 @@ func (m *manager) registerManager(ctx context.Context) error {
 		}
 		return friendly
 	}
+	return m.syncManagerRegistration(ctx, userJWT)
+}
+
+func (m *manager) syncRegisteredManagerSession(ctx context.Context) error {
+	managerID := strings.TrimSpace(m.state.ManagerID)
+	if managerID == "" {
+		return nil
+	}
+	session, err := m.loadSession()
+	if err != nil {
+		return nil
+	}
+	accessToken := strings.TrimSpace(session.AccessToken)
+	refreshToken := strings.TrimSpace(session.RefreshToken)
+	if accessToken == "" || refreshToken == "" || sessionAccessTokenExpired(session) {
+		return nil
+	}
+	path := fmt.Sprintf("/local-agent-managers/%s/session", managerID)
+	return m.requestJSON(
+		ctx,
+		http.MethodPost,
+		path,
+		map[string]string{"refreshToken": refreshToken},
+		nil,
+		accessToken,
+	)
+}
+
+func (m *manager) syncManagerRegistration(ctx context.Context, userJWT string) error {
 	payload := map[string]any{
-		"machineName":            m.cfg.MachineName,
-		"executionMode":          m.cfg.ExecutionMode,
-		"maxConcurrentInstances": m.cfg.MaxConcurrent,
-		"supportedRuntimeIds":    []string{},
-		"managerVersion":         currentManagerVersion(),
-		"platform":               runtime.GOOS,
-		"installChannel":         currentInstallChannel(),
+		"machineName":                   m.cfg.MachineName,
+		"executionMode":                 m.cfg.ExecutionMode,
+		"maxConcurrentInstances":        m.cfg.MaxConcurrent,
+		"installedCodingAgentProviders": installedCodingAgentProviders(),
+		"managerVersion":                currentManagerVersion(),
+		"platform":                      runtime.GOOS,
+		"installChannel":                currentInstallChannel(),
 	}
 	if session, loadErr := m.loadSession(); loadErr == nil && strings.TrimSpace(session.RefreshToken) != "" {
 		payload["refreshToken"] = strings.TrimSpace(session.RefreshToken)
@@ -3227,6 +3280,35 @@ func (m *manager) registerManager(ctx context.Context) error {
 	}
 	m.logInfo("manager_registered manager_id=%s", m.state.ManagerID)
 	return writeState(m.cfg.StateFile, m.state)
+}
+
+func detectInstalledCodingAgentProviders() map[string]bool {
+	commandsByProvider := map[string]string{
+		"CODEX":       "codex",
+		"CLAUDE_CODE": "claude",
+		"GEMINI_CLI":  "gemini",
+		"OPENCODE":    "opencode",
+	}
+	installed := make(map[string]bool, len(commandsByProvider))
+	for provider, command := range commandsByProvider {
+		if err := codingAgentVersionCheck(command); err == nil {
+			installed[provider] = true
+		}
+	}
+	return installed
+}
+
+func installedCodingAgentProviders() []string {
+	installedProviders := detectInstalledCodingAgentProviders()
+	if len(installedProviders) == 0 {
+		return []string{}
+	}
+	providers := make([]string, 0, len(installedProviders))
+	for provider := range installedProviders {
+		providers = append(providers, provider)
+	}
+	sort.Strings(providers)
+	return providers
 }
 
 func (m *manager) refreshManagerUserIdentity(ctx context.Context) error {
@@ -4027,6 +4109,35 @@ func (m *manager) spawnWorkerWithWorkingDir(
 	}
 	if !claimOut.Claimed {
 		return fmt.Errorf("task claim was not granted")
+	}
+	updatePayload := map[string]string{
+		"taskId":                  task.ID,
+		"currentTaskId":           task.ID,
+		"assignedAgentInstanceId": instanceID,
+		"localAgentManagerId":     m.state.ManagerID,
+		"workingDirectory":        workingDir,
+	}
+	if err := m.managerRequestJSON(
+		ctx,
+		http.MethodPost,
+		"/agent-instances/"+instanceID+"/update-task",
+		updatePayload,
+		nil,
+	); err != nil {
+		m.logWarn(
+			"task_claim_state_persist_failed instance_id=%s task_id=%s err=%v",
+			instanceID,
+			task.ID,
+			err,
+		)
+	} else {
+		m.logInfo(
+			"task_claim_state_persisted instance_id=%s task_id=%s manager_id=%s working_dir=%s",
+			instanceID,
+			task.ID,
+			m.state.ManagerID,
+			workingDir,
+		)
 	}
 	m.logInfo("task_status_updated task_id=%s status=IN_PROGRESS", task.ID)
 
@@ -5138,10 +5249,7 @@ func (m *manager) scanLifecycleMarkers(ctx context.Context, w *worker, chunk str
 		}
 		w.pendingTaskCompleted = ""
 		w.pendingTaskCompletedAt = time.Time{}
-		payload := map[string]string{
-			"status":  event.status,
-			"comment": event.comment,
-		}
+		payload := m.lifecycleTaskUpdatePayload(w, event.status, event.comment)
 		if err := m.managerRequestJSON(
 			ctx,
 			http.MethodPost,
@@ -5181,10 +5289,11 @@ func (m *manager) flushPendingTaskCompleted(
 	if !force && time.Since(w.pendingTaskCompletedAt) < taskCompletedGrace {
 		return
 	}
-	payload := map[string]string{
-		"status":  "READY_FOR_REVIEW",
-		"comment": w.pendingTaskCompleted,
-	}
+	payload := m.lifecycleTaskUpdatePayload(
+		w,
+		"READY_FOR_REVIEW",
+		w.pendingTaskCompleted,
+	)
 	if err := m.managerRequestJSON(
 		ctx,
 		http.MethodPost,
@@ -5204,6 +5313,27 @@ func (m *manager) flushPendingTaskCompleted(
 	w.pendingTaskCompletedAt = time.Time{}
 	m.syncLessonsForAgent(w.agentID)
 	m.logInfo("lifecycle_marker instance_id=%s marker=TASK_COMPLETED", w.instanceID)
+}
+
+func (m *manager) lifecycleTaskUpdatePayload(w *worker, status, comment string) map[string]string {
+	payload := map[string]string{
+		"status":  status,
+		"comment": comment,
+	}
+	if taskID := strings.TrimSpace(w.taskID); taskID != "" {
+		payload["taskId"] = taskID
+		payload["currentTaskId"] = taskID
+	}
+	if instanceID := strings.TrimSpace(w.instanceID); instanceID != "" {
+		payload["assignedAgentInstanceId"] = instanceID
+	}
+	if managerID := strings.TrimSpace(m.state.ManagerID); managerID != "" {
+		payload["localAgentManagerId"] = managerID
+	}
+	if workingDir := strings.TrimSpace(w.workingDir); workingDir != "" {
+		payload["workingDirectory"] = workingDir
+	}
+	return payload
 }
 
 func (m *manager) batchLogsLoop(ctx context.Context, w *worker) {
@@ -6191,10 +6321,11 @@ func (m *manager) monitorWorkerExit(w *worker) {
 		if summary != "" {
 			comment += "\nLast output:\n" + summary
 		}
-		payload := map[string]string{
-			"comment": comment,
-			"status":  "WAITING_FOR_USER_INPUT",
-		}
+		payload := m.lifecycleTaskUpdatePayload(
+			w,
+			"WAITING_FOR_USER_INPUT",
+			comment,
+		)
 		_ = m.managerRequestJSON(context.Background(), http.MethodPost, "/agent-instances/"+w.instanceID+"/update-task", payload, nil)
 		m.syncLessonsForAgent(w.agentID)
 
@@ -6216,10 +6347,7 @@ func (m *manager) monitorWorkerExit(w *worker) {
 		statusUpdate = "WAITING_FOR_USER_INPUT"
 	}
 
-	payload := map[string]string{
-		"comment": comment,
-		"status":  statusUpdate,
-	}
+	payload := m.lifecycleTaskUpdatePayload(w, statusUpdate, comment)
 	_ = m.managerRequestJSON(context.Background(), http.MethodPost, "/agent-instances/"+w.instanceID+"/update-task", payload, nil)
 	if err == nil {
 		m.syncLessonsForAgent(w.agentID)
@@ -6460,6 +6588,21 @@ func (m *manager) getFreshStoredSession(ctx context.Context, forceRefresh bool) 
 				return recovered, nil
 			} else {
 				m.logWarn("manager_session_recovery_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), recoverErr)
+				if isStoredManagerSessionInvalidError(recoverErr) && !sessionAccessTokenExpired(session) {
+					if syncErr := m.syncManagerRegistration(ctx, session.AccessToken); syncErr == nil {
+						if recovered, retryErr := m.recoverManagerSession(ctx); retryErr == nil {
+							m.logInfo("manager_session_recovery_succeeded_after_reregister manager_id=%s", strings.TrimSpace(m.state.ManagerID))
+							if err := m.saveSession(recovered); err != nil {
+								return storedSession{}, err
+							}
+							return recovered, nil
+						} else {
+							m.logWarn("manager_session_recovery_retry_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), retryErr)
+						}
+					} else {
+						m.logWarn("manager_registration_resync_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), syncErr)
+					}
+				}
 			}
 			return storedSession{}, wrapRefreshTokenError(err)
 		}
@@ -6775,10 +6918,22 @@ func cleanCLIError(err error) string {
 	if err == nil {
 		return ""
 	}
-	if isRefreshTokenRotationError(err) {
-		return "Refresh token invalid or already used. Run 'passiveagents login'."
+	if isLoginRequiredCLIError(err) {
+		return loginAgainCLIMessage
 	}
 	return sanitizeKeyringError(err).Error()
+}
+
+func isLoginRequiredCLIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isRefreshTokenRotationError(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "run 'passiveagents login'") ||
+		strings.Contains(msg, "run login again")
 }
 
 func sessionNeedsRefresh(session storedSession) bool {
@@ -6795,6 +6950,13 @@ func isRefreshRateLimitError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "over_request_rate_limit") || strings.Contains(msg, "status code 429")
+}
+
+func isStoredManagerSessionInvalidError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "stored manager session is invalid")
 }
 
 func sessionAccessTokenExpired(session storedSession) bool {
