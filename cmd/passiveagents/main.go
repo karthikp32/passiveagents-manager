@@ -7,6 +7,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	cryptorand "crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -72,6 +74,7 @@ var (
 	shutdownKillRetryBaseDelay = 250 * time.Millisecond
 	shutdownKillRetryMaxDelay  = 2 * time.Second
 	cmdStart                   = func(cmd *exec.Cmd) error { return cmd.Start() }
+	signalManagedPIDFunc       = signalManagedPID
 	codingAgentVersionCheck    = func(command string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -80,14 +83,18 @@ var (
 		cmd.Stderr = io.Discard
 		return cmd.Run()
 	}
-	killManagedPIDFunc = killManagedPID
-	managerRuntimeGOOS = func() string { return runtime.GOOS }
+	killManagedPIDFunc       = killManagedPID
+	managerRuntimeGOOS       = func() string { return runtime.GOOS }
+	storedSessionKeyMaterial = defaultStoredSessionKeyMaterial
 )
 
 const (
 	maxTerminalReplayBytes      = 8 * 1024 * 1024
 	maxPTYDimension             = 65535
 	taskCompletedGrace          = 750 * time.Millisecond
+	lifecycleUpdateRetryDefault = 30 * time.Second
+	lifecycleUpdateRetryMin     = 2 * time.Second
+	lifecycleUpdateRetryMax     = 60 * time.Second
 	gracefulShutdownWait        = 60 * time.Second
 	openCodeResumeWait          = 1500 * time.Millisecond
 	openCodeResumeHintWait      = 5 * time.Second
@@ -115,10 +122,6 @@ func printRefreshTokenMessage() {
 	fmt.Println(loginAgainCLIMessage)
 }
 
-func missingRecoveryTokenInstructionError() error {
-	return fmt.Errorf("manager session recovery is not configured; run 'passiveagents login'")
-}
-
 type config struct {
 	WebBaseURL           string
 	APIBaseURL           string
@@ -137,6 +140,7 @@ type config struct {
 	LogFlushInterval     time.Duration
 	LogFlushBatchSize    int
 	PollSnapshotFile     string
+	TasksMetadataFile    string
 	StreamPort           int
 	CloudflareTunnelName string
 	CloudflaredBinary    string
@@ -144,22 +148,39 @@ type config struct {
 	SupabaseAnonKey      string
 	ManagerLogFile       string
 	LessonsBaseDir       string
+	LessonsJSONLFile     string
+}
+
+type taskMetadataStore struct {
+	Tasks map[string]taskMetadata `json:"tasks"`
+}
+
+type taskMetadata struct {
+	ID             string `json:"id"`
+	Status         string `json:"status,omitempty"`
+	AgentID        string `json:"agent_id,omitempty"`
+	InstanceID     string `json:"instance_id,omitempty"`
+	WorkingDir     string `json:"working_dir,omitempty"`
+	LastUpdatedAt  string `json:"last_updated_at,omitempty"`
+	LastObservedAt string `json:"last_observed_at,omitempty"`
 }
 
 type persistedState struct {
-	ManagerID            string                     `json:"manager_id"`
-	ManagerPID           int                        `json:"manager_pid,omitempty"`
-	LegacyDaemonPID      int                        `json:"daemon_pid,omitempty"`
-	ManagerRecoveryToken string                     `json:"manager_recovery_token,omitempty"`
-	SupabaseURL          string                     `json:"supabase_url,omitempty"`
-	SupabaseAnonKey      string                     `json:"supabase_anon_key,omitempty"`
-	ManagerSubdomain     string                     `json:"manager_subdomain,omitempty"`
-	TunnelToken          string                     `json:"tunnel_token,omitempty"`
-	ExpiresAt            string                     `json:"expires_at"`
-	Instances            map[string]persistedWorker `json:"instances"`
-	AllowedFolders       []allowedFolder            `json:"allowed_folders,omitempty"`
-	PersonaLessonHashes  map[string]string          `json:"persona_lesson_hashes,omitempty"`
-	LastLessonsPullAt    string                     `json:"last_lessons_pull_at,omitempty"`
+	ManagerID           string                     `json:"manager_id"`
+	ManagerPID          int                        `json:"manager_pid,omitempty"`
+	LegacyDaemonPID     int                        `json:"daemon_pid,omitempty"`
+	SupabaseURL         string                     `json:"supabase_url,omitempty"`
+	SupabaseAnonKey     string                     `json:"supabase_anon_key,omitempty"`
+	ManagerSubdomain    string                     `json:"manager_subdomain,omitempty"`
+	TunnelToken         string                     `json:"tunnel_token,omitempty"`
+	AuthRequired        bool                       `json:"auth_required,omitempty"`
+	ReauthSessionID     string                     `json:"reauth_session_id,omitempty"`
+	ReauthCodeVerifier  string                     `json:"reauth_code_verifier,omitempty"`
+	ExpiresAt           string                     `json:"expires_at"`
+	Instances           map[string]persistedWorker `json:"instances"`
+	AllowedFolders      []allowedFolder            `json:"allowed_folders,omitempty"`
+	PersonaLessonHashes map[string]string          `json:"persona_lesson_hashes,omitempty"`
+	LastLessonsPullAt   string                     `json:"last_lessons_pull_at,omitempty"`
 }
 
 type storedSession struct {
@@ -168,6 +189,12 @@ type storedSession struct {
 	ExpiresAt    int64  `json:"expires_at"`
 	UserID       string `json:"user_id,omitempty"`
 	UserEmail    string `json:"user_email,omitempty"`
+}
+
+type encryptedStoredSession struct {
+	Version    string `json:"version"`
+	Nonce      string `json:"nonce"`
+	Ciphertext string `json:"ciphertext"`
 }
 
 type persistedWorker struct {
@@ -194,98 +221,104 @@ type apiAgentInstanceStatus struct {
 }
 
 type manager struct {
-	cfg                     config
-	state                   persistedState
-	previousManagerPID      int
-	client                  *http.Client
-	logger                  *slog.Logger
-	mu                      sync.Mutex
-	cpu                     float64
-	lastCPUTimes            *cpu.TimesStat
-	freeMB                  float64
-	freePct                 float64
-	totalMB                 float64
-	cpuHighStreak           int
-	lastSpawnAt             time.Time
-	pollNow                 chan struct{}
-	workers                 map[string]*worker
-	sessionRefreshMu        sync.Mutex
-	sessionRefreshRetryAt   time.Time
-	browserClients          map[*browserClient]struct{}
-	browserMu               sync.RWMutex
-	streamServer            *http.Server
-	streamListener          net.Listener
-	tunnelCmd               *exec.Cmd
-	tunnelMu                sync.Mutex
-	tunnelID                string
-	tunnelReady             atomic.Bool
-	instanceSpawnLocks      map[string]*sync.Mutex
-	managerSubdomain        string
-	tunnelToken             string
-	userID                  string
-	supabaseBootstrapSynced bool
-	browserPreferredSizes   map[string]terminalSize
-	refreshSessionHook      func(context.Context, string) (storedSession, error)
+	cfg                      config
+	state                    persistedState
+	previousManagerPID       int
+	client                   *http.Client
+	logger                   *slog.Logger
+	mu                       sync.Mutex
+	cpu                      float64
+	lastCPUTimes             *cpu.TimesStat
+	freeMB                   float64
+	freePct                  float64
+	totalMB                  float64
+	cpuHighStreak            int
+	lastSpawnAt              time.Time
+	pollNow                  chan struct{}
+	workers                  map[string]*worker
+	sessionRefreshMu         sync.Mutex
+	sessionRefreshRetryAt    time.Time
+	browserClients           map[*browserClient]struct{}
+	browserMu                sync.RWMutex
+	streamServer             *http.Server
+	streamListener           net.Listener
+	tunnelCmd                *exec.Cmd
+	tunnelMu                 sync.Mutex
+	tunnelID                 string
+	tunnelReady              atomic.Bool
+	instanceSpawnLocks       map[string]*sync.Mutex
+	managerSubdomain         string
+	tunnelToken              string
+	userID                   string
+	supabaseBootstrapSynced  bool
+	browserPreferredSizes    map[string]terminalSize
+	refreshSessionHook       func(context.Context, string) (storedSession, error)
+	lastHeartbeatTunnelReady bool
+	lastHeartbeatLogAt       time.Time
+	taskMetadataMu           sync.Mutex
 }
 
 type worker struct {
-	instanceID              string
-	taskID                  string
-	agentID                 string
-	sessionID               string
-	workingDir              string
-	runtimeCommand          string
-	cmd                     *exec.Cmd
-	input                   io.WriteCloser
-	output                  io.ReadCloser
-	logs                    chan logEntry
-	stopBatch               chan struct{}
-	outputBuffer            *outputRingBuffer
-	terminalState           *vtScreenState
-	terminalStateMu         sync.Mutex
-	terminalOutputSeq       uint64
-	terminalReplayEventSeq  uint64
-	terminalReplayBuffer    *terminalReplayBuffer
-	terminalCols            int
-	terminalRows            int
-	terminalSizeLocked      bool
-	sawTaskCompleted        bool
-	sawNeedsUserInput       bool
-	pendingTaskCompleted    string
-	pendingTaskCompletedAt  time.Time
-	localLogFilePath        string
-	localTranscriptFilePath string
-	localCommandFilePath    string
-	usesPTY                 bool
-	assistantMu             sync.Mutex
-	assistantBuf            strings.Builder
-	assistantLastFragmentAt time.Time
-	assistantStop           chan struct{}
-	attachListener          net.Listener
-	attachClients           map[net.Conn]struct{}
-	attachMu                sync.Mutex
-	deliveredCommandIDs     map[string]struct{}
-	deliveredCommandMu      sync.Mutex
-	bootstrapPromptPending  bool
-	bootstrapPromptMu       sync.Mutex
-	shutdownRequested       bool
-	shutdownPrompt          string
-	shutdownMode            string
-	shutdownMu              sync.Mutex
-	resourceMu              sync.Mutex
-	startedAt               time.Time
-	observedRSSMB           float64
-	observedCPUCores        float64
-	lastResourceSampleAt    time.Time
-	idleTimer               *time.Timer
-	idleStartedAt           time.Time // first moment agent entered ready-empty; zero when busy
-	idleTimerMu             sync.Mutex
-	done                    chan struct{}
-	tracked                 atomic.Bool
-	livestreamReady         atomic.Bool
-	bootstrapObserved       atomic.Bool
-	bootstrapObservedAt     atomic.Int64
-	bootstrapReadyEmptySeen atomic.Bool
+	instanceID                  string
+	taskID                      string
+	taskName                    string
+	taskStatus                  string
+	agentID                     string
+	sessionID                   string
+	workingDir                  string
+	runtimeCommand              string
+	cmd                         *exec.Cmd
+	input                       io.WriteCloser
+	output                      io.ReadCloser
+	logs                        chan logEntry
+	stopBatch                   chan struct{}
+	outputBuffer                *outputRingBuffer
+	terminalState               *vtScreenState
+	terminalStateMu             sync.Mutex
+	terminalOutputSeq           uint64
+	terminalReplayEventSeq      uint64
+	terminalReplayBuffer        *terminalReplayBuffer
+	terminalCols                int
+	terminalRows                int
+	terminalSizeLocked          bool
+	sawTaskCompleted            bool
+	sawNeedsUserInput           bool
+	pendingTaskCompleted        string
+	pendingTaskCompletedAt      time.Time
+	pendingTaskCompletedRetryAt time.Time
+	localLogFilePath            string
+	localTranscriptFilePath     string
+	localCommandFilePath        string
+	usesPTY                     bool
+	assistantMu                 sync.Mutex
+	assistantBuf                strings.Builder
+	assistantLastFragmentAt     time.Time
+	assistantStop               chan struct{}
+	attachListener              net.Listener
+	attachClients               map[net.Conn]struct{}
+	attachMu                    sync.Mutex
+	deliveredCommandIDs         map[string]struct{}
+	deliveredCommandMu          sync.Mutex
+	bootstrapPromptPending      bool
+	bootstrapPromptMu           sync.Mutex
+	shutdownRequested           bool
+	shutdownPrompt              string
+	shutdownMode                string
+	shutdownMu                  sync.Mutex
+	resourceMu                  sync.Mutex
+	startedAt                   time.Time
+	observedRSSMB               float64
+	observedCPUCores            float64
+	lastResourceSampleAt        time.Time
+	idleTimer                   *time.Timer
+	idleStartedAt               time.Time // first moment agent entered ready-empty; zero when busy
+	idleTimerMu                 sync.Mutex
+	done                        chan struct{}
+	tracked                     atomic.Bool
+	livestreamReady             atomic.Bool
+	bootstrapObserved           atomic.Bool
+	bootstrapObservedAt         atomic.Int64
+	bootstrapReadyEmptySeen     atomic.Bool
 }
 
 type browserClient struct {
@@ -576,6 +609,13 @@ type apiAgentPersona struct {
 	} `json:"agent_runtimes"`
 }
 
+type lessonJSONLRecord struct {
+	AgentPersonaID string `json:"agent_persona_id"`
+	Lesson         string `json:"lesson"`
+	Source         string `json:"source,omitempty"`
+	CreatedAt      string `json:"created_at,omitempty"`
+}
+
 type apiTask struct {
 	ID               string   `json:"id"`
 	Name             string   `json:"name"`
@@ -604,18 +644,24 @@ const (
 	defaultAPIBaseURL              = "https://api.passiveagents.com"
 	keyringService                 = "passiveagents"
 	keyringUser                    = "default-session"
-	keyringRecoveryTokenUser       = "manager-recovery-token"
 	tokenRefreshSkew               = 5 * time.Minute
 	sessionRefreshRateLimitBackoff = 30 * time.Second
 	authFileName                   = "auth.json"
+	authKeyFileName                = "auth.key"
+	storedSessionKeySalt           = "passiveagents-stored-session-v1"
 	pollSnapshotFileName           = "polled-task-batch.json"
+	minPTYCols                     = 80
+	minPTYRows                     = 8
 	cpuHighStreakThreshold         = 3
 	ramUtilizationCapPct           = 80
+	agentCPUConcurrencyCapFraction = 0.25
 	defaultSteadyAgentCPUCores     = 0.25
 	defaultStartupAgentCPUCores    = 0.5
 	workerStartupObservationWindow = 45 * time.Second
 	startupResourceCostMultiplier  = 1.25
 	spawnCooldown                  = 5 * time.Second
+	defaultAgentNiceValue          = 10
+	maxAgentNiceValue              = 19
 )
 
 var (
@@ -645,6 +691,12 @@ func formattedManagerVersion() string {
 func newRootCommand(cfg config) *cobra.Command {
 	root := &cobra.Command{Use: "passiveagents"}
 	root.SilenceUsage = true
+	root.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		if shouldSkipAuthRequiredNotice(cmd) {
+			return
+		}
+		printAuthRequiredNotice(cfg.StateFile, cmd.ErrOrStderr())
+	}
 	root.Version = strings.TrimPrefix(formattedManagerVersion(), "passiveagents ")
 	root.SetVersionTemplate("passiveagents {{.Version}}\n")
 	root.SetHelpTemplate(`Usage:
@@ -699,9 +751,6 @@ Use "{{.CommandPath}} [command] --help" for more information about a command.
 		Use:   "start",
 		Short: "Start PassiveAgents local manager",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := ensurePersistedManagerRecoveryToken(cfg.StateFile); err != nil {
-				return err
-			}
 			return startManagerProcess(cfg)
 		},
 	})
@@ -771,9 +820,6 @@ Use "{{.CommandPath}} [command] --help" for more information about a command.
 		Use:   "status",
 		Short: "Show manager status",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := ensurePersistedManagerRecoveryToken(cfg.StateFile); err != nil {
-				return err
-			}
 			supervisor := installedManagerSupervisor(cfg)
 			pid, err := readManagerPIDFromState(cfg.StateFile)
 			if err != nil {
@@ -947,19 +993,41 @@ Global Flags:
 		Use:   "stop",
 		Short: "Stop PassiveAgents local manager",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := ensurePersistedManagerRecoveryToken(cfg.StateFile); err != nil {
-				return err
-			}
 			return stopManagerProcess(cfg)
 		},
 	})
 	return root
 }
 
+func shouldSkipAuthRequiredNotice(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	switch cmd.CommandPath() {
+	case "passiveagents login", "passiveagents stop", "passiveagents version", "passiveagents run-manager":
+		return true
+	default:
+		return false
+	}
+}
+
+func printAuthRequiredNotice(stateFilePath string, writer io.Writer) {
+	state, err := readState(stateFilePath)
+	if err != nil || !state.AuthRequired {
+		return
+	}
+	if writer == nil {
+		writer = os.Stderr
+	}
+	fmt.Fprintln(writer, loginAgainCLIMessage)
+}
+
 func loadConfig() config {
 	home, _ := os.UserHomeDir()
 	stateFile := filepath.Join(home, ".passiveagents", "manager-state.json")
 	lessonsBaseDir := filepath.Join(home, ".passiveagents", "agents")
+	lessonsJSONLFile := filepath.Join(home, ".passiveagents", "lessons.jsonl")
+	tasksMetadataFile := filepath.Join(home, ".passiveagents", "tasks.json")
 	managerLogFile := filepath.Join(home, ".passiveagents", "manager.log")
 	pollSnapshotFile := filepath.Join(home, ".passiveagents", pollSnapshotFileName)
 	systemReserveMB, mbPerAgent := estimateMemoryTuning()
@@ -995,10 +1063,12 @@ func loadConfig() config {
 		LogFlushInterval:     100 * time.Millisecond,
 		LogFlushBatchSize:    50,
 		PollSnapshotFile:     pollSnapshotFile,
+		TasksMetadataFile:    getenv("PASSIVEAGENTS_TASKS_METADATA_FILE", tasksMetadataFile),
 		SupabaseURL:          strings.TrimSuffix(strings.TrimSpace(os.Getenv("PASSIVEAGENTS_SUPABASE_URL")), "/"),
 		SupabaseAnonKey:      strings.TrimSpace(os.Getenv("PASSIVEAGENTS_SUPABASE_ANON_KEY")),
 		CloudflaredBinary:    strings.TrimSpace(os.Getenv("PASSIVEAGENTS_CLOUDFLARED_PATH")),
 		ManagerLogFile:       getenv("PASSIVEAGENTS_MANAGER_LOG_FILE", managerLogFile),
+		LessonsJSONLFile:     getenv("PASSIVEAGENTS_LESSONS_JSONL_FILE", lessonsJSONLFile),
 		StreamPort:           getenvInt("PASSIVEAGENTS_STREAM_PORT", 0),
 		CloudflareTunnelName: getenv("PASSIVEAGENTS_CLOUDFLARE_TUNNEL_NAME", "passiveagents"),
 		LessonsBaseDir:       getenv("PASSIVEAGENTS_LESSONS_BASE_DIR", lessonsBaseDir),
@@ -1336,6 +1406,15 @@ func (m *manager) login(ctx context.Context) error {
 			if err := m.saveSession(session); err != nil {
 				return err
 			}
+			if err := m.updateManagerAuthState(false, "", ""); err != nil {
+				return err
+			}
+			if err := m.syncRegisteredManagerSession(ctx); err != nil {
+				m.logWarn("manager_session_sync_after_login_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), err)
+			}
+			if err := m.notifyRunningManagerAuthReload(); err != nil {
+				m.logWarn("manager_auth_reload_notify_failed err=%v", err)
+			}
 			if session.UserEmail != "" {
 				fmt.Printf("Authentication complete. Logged in as: %s\n", maskEmail(session.UserEmail))
 			} else {
@@ -1432,12 +1511,29 @@ func (m *manager) startForeground(ctx context.Context) error {
 
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	hupSignal := make(chan os.Signal, 1)
+	signal.Notify(hupSignal, syscall.SIGHUP)
+	defer signal.Stop(hupSignal)
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hupSignal:
+				if err := m.reloadAuthStateFromDisk(); err != nil {
+					m.logWarn("manager_auth_reload_failed err=%v", err)
+				}
+			}
+		}
+	}()
 
 	go m.resourceLoop(ctx)
 	go m.heartbeatLoop(ctx)
 	go m.instanceHeartbeatLoop(ctx)
 	go m.pollLoop(ctx)
 	go m.userSessionRefreshLoop(ctx)
+	go m.reauthSessionLoop(ctx)
 	go m.lessonsSyncLoop(ctx)
 	go m.lessonsPullLoop(ctx)
 	go m.tunnelWatchLoop(ctx)
@@ -1505,6 +1601,7 @@ func (m *manager) managerStreamHandler(w http.ResponseWriter, r *http.Request) {
 	defer m.removeBrowserClient(client)
 
 	_ = m.writeBrowserEvent(client, map[string]any{"type": "connection_ready"})
+	_ = m.writeBrowserEvent(client, m.currentManagerAuthStatePayload())
 	m.handleManagerConnection(r.Context(), client)
 }
 
@@ -1576,7 +1673,7 @@ func (m *manager) handleManagerConnection(ctx context.Context, client *browserCl
 				})
 				return
 			}
-			_ = m.writeBrowserEvent(client, map[string]any{"type": "authenticated"})
+			_ = m.writeBrowserEvents(client, map[string]any{"type": "authenticated"}, m.currentManagerAuthStatePayload())
 		case "subscribe_instance":
 			if !browserClientAuthenticated(client) {
 				_ = m.writeBrowserEvent(client, map[string]any{
@@ -1822,6 +1919,16 @@ func (m *manager) currentManagerUserID(ctx context.Context) (string, error) {
 	if userID != "" {
 		return userID, nil
 	}
+	if session, err := m.loadSession(); err == nil {
+		if storedUserID := strings.TrimSpace(session.UserID); storedUserID != "" {
+			m.mu.Lock()
+			if strings.TrimSpace(m.userID) == "" {
+				m.userID = storedUserID
+			}
+			m.mu.Unlock()
+			return storedUserID, nil
+		}
+	}
 	if err := m.refreshManagerUserIdentity(ctx); err != nil {
 		return "", err
 	}
@@ -1942,6 +2049,12 @@ func (m *manager) sendInitialStatesForInstance(client *browserClient, instanceID
 		"type":        "agent_state",
 		"instance_id": instanceID,
 		"state":       agentState,
+	}
+	if taskID, taskName := m.workerTaskInfo(instanceID); taskID != "" {
+		agentPayload["task_id"] = taskID
+		if taskName != "" {
+			agentPayload["task_name"] = taskName
+		}
 	}
 	if agentMessage != "" {
 		agentPayload["message"] = agentMessage
@@ -2072,6 +2185,14 @@ func (m *manager) setWorkerTerminalSize(worker *worker, cols, rows int, applyPTY
 
 func clampPTYDimensions(cols, rows int) (int, int, bool) {
 	clipped := false
+	if cols < minPTYCols {
+		cols = minPTYCols
+		clipped = true
+	}
+	if rows < minPTYRows {
+		rows = minPTYRows
+		clipped = true
+	}
 	if cols > maxPTYDimension {
 		cols = maxPTYDimension
 		clipped = true
@@ -2506,7 +2627,7 @@ func calculateCapacitySnapshot(inputs capacityInputs) capacitySnapshot {
 		fallbackAgentRAMMB = 1024
 	}
 
-	cpuHardCap := int(math.Floor(float64(cores) * 0.5))
+	cpuHardCap := int(math.Floor(float64(cores) * agentCPUConcurrencyCapFraction))
 	if cpuHardCap < 1 {
 		cpuHardCap = 1
 	}
@@ -2619,7 +2740,7 @@ func (m *manager) currentCapacitySnapshot() capacitySnapshot {
 }
 
 func buildGracefulShutdownPrompt() string {
-	return "Before you shut down, read TASK_CONTEXT.md to understand previous checkpoints, write any new progress to TASK_CONTEXT.md and append a new lesson learned to lessons.md, then exit. If you didn't do much, don't append a new lesson."
+	return "Before you shut down, read TASK_CONTEXT.md to understand previous checkpoints, write any new progress to TASK_CONTEXT.md and append a new JSON object with a new lesson field to lessons.jsonl, then exit. Aim to append a new lesson that will help your performance on similar types of tasks in the future. If the task was very simple, don't append a new lesson."
 }
 
 func workerShutdownStatusMessage(mode string) string {
@@ -2912,6 +3033,12 @@ func (m *manager) broadcastAgentState(instanceID, state, message string) {
 		"instance_id": instanceID,
 		"state":       strings.TrimSpace(state),
 	}
+	if taskID, taskName := m.workerTaskInfo(instanceID); taskID != "" {
+		payload["task_id"] = taskID
+		if taskName != "" {
+			payload["task_name"] = taskName
+		}
+	}
 	if workingDir := m.workerWorkingDir(instanceID); workingDir != "" {
 		payload["working_dir"] = workingDir
 	}
@@ -3027,6 +3154,14 @@ func (m *manager) workerWorkingDir(instanceID string) string {
 		return ""
 	}
 	return strings.TrimSpace(worker.workingDir)
+}
+
+func (m *manager) workerTaskInfo(instanceID string) (string, string) {
+	worker := m.workerForInstanceID(instanceID)
+	if worker == nil {
+		return "", ""
+	}
+	return strings.TrimSpace(worker.taskID), strings.TrimSpace(worker.taskName)
 }
 
 func (m *manager) stopStreamServer() {
@@ -3178,8 +3313,7 @@ func (m *manager) registerManager(ctx context.Context) error {
 	// After the first successful registration, reuse local manager credentials.
 	// If either piece is missing locally, re-fetch the stored manager credentials.
 	if strings.TrimSpace(m.state.ManagerID) != "" &&
-		strings.TrimSpace(m.state.TunnelToken) != "" &&
-		strings.TrimSpace(loadManagerRecoveryToken(m.state)) != "" {
+		strings.TrimSpace(m.state.TunnelToken) != "" {
 		if err := m.syncRegisteredManagerSession(ctx); err != nil {
 			m.logWarn(
 				"manager_session_sync_failed manager_id=%s err=%v",
@@ -3245,11 +3379,10 @@ func (m *manager) syncManagerRegistration(ctx context.Context, userJWT string) e
 		payload["refreshToken"] = strings.TrimSpace(session.RefreshToken)
 	}
 	var out struct {
-		MachineID            string `json:"machineId"`
-		ManagerRecoveryToken string `json:"managerRecoveryToken"`
-		ManagerSubdomain     string `json:"managerSubdomain"`
-		TunnelID             string `json:"tunnelId"`
-		TunnelToken          string `json:"tunnelToken"`
+		MachineID        string `json:"machineId"`
+		ManagerSubdomain string `json:"managerSubdomain"`
+		TunnelID         string `json:"tunnelId"`
+		TunnelToken      string `json:"tunnelToken"`
 	}
 	if err := m.requestJSON(
 		ctx,
@@ -3264,9 +3397,6 @@ func (m *manager) syncManagerRegistration(ctx context.Context, userJWT string) e
 	}
 
 	m.state.ManagerID = out.MachineID
-	if strings.TrimSpace(out.ManagerRecoveryToken) != "" {
-		m.persistManagerRecoveryToken(out.ManagerRecoveryToken)
-	}
 	if strings.TrimSpace(out.ManagerSubdomain) != "" {
 		m.state.ManagerSubdomain = out.ManagerSubdomain
 		m.managerSubdomain = out.ManagerSubdomain
@@ -3318,7 +3448,30 @@ func (m *manager) refreshManagerUserIdentity(ctx context.Context) error {
 	}
 	claims, err := m.validateSupabaseJWT(userJWT)
 	if err != nil {
-		return err
+		if strings.TrimSpace(m.cfg.UserJWT) == "" && isInvalidAccessTokenError(err) {
+			m.logWarn("manager_user_identity_access_token_rejected_refreshing manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), err)
+			refreshed, refreshErr := m.getFreshStoredSession(ctx, true)
+			if refreshErr == nil {
+				claims, err = m.validateSupabaseJWT(refreshed.AccessToken)
+				if err == nil {
+					m.logInfo("manager_user_identity_recovered_with_refreshed_access_token manager_id=%s", strings.TrimSpace(m.state.ManagerID))
+				}
+			} else {
+				m.logWarn("manager_user_identity_forced_refresh_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), wrapRefreshTokenError(refreshErr))
+				err = refreshErr
+			}
+			if err != nil && isRefreshTokenRotationError(err) {
+				if reauthErr := m.beginManagerReauth(ctx); reauthErr != nil {
+					m.logWarn("manager_reauth_init_failed_after_invalid_access_token manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), reauthErr)
+					if stateErr := m.updateManagerAuthState(true, "", ""); stateErr != nil {
+						m.logWarn("manager_auth_required_persist_failed_after_invalid_access_token manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), stateErr)
+					}
+				}
+			}
+		}
+		if err != nil {
+			return err
+		}
 	}
 	userID := strings.TrimSpace(claimString(claims, "sub"))
 	if userID == "" {
@@ -3502,7 +3655,9 @@ func (m *manager) heartbeatLoop(ctx context.Context) {
 	ticker := time.NewTicker(m.cfg.HeartbeatInterval)
 	defer ticker.Stop()
 	for {
-		_ = m.sendHeartbeat(ctx)
+		if err := m.sendHeartbeat(ctx); err != nil {
+			m.logError("manager_heartbeat_error err=%v", err)
+		}
 		if err := m.refreshAllowedFoldersFromBackend(ctx); err != nil {
 			m.logError("allowed_folders_refresh_error err=%v", err)
 		}
@@ -3518,27 +3673,64 @@ func (m *manager) sendHeartbeat(ctx context.Context) error {
 	m.mu.Lock()
 	cpuVal, memVal, totalMB := m.cpu, m.freeMB, m.totalMB
 	managerID := m.state.ManagerID
+	authRequired := m.state.AuthRequired
+	reauthSessionID := strings.TrimSpace(m.state.ReauthSessionID)
 	m.mu.Unlock()
 	tunnelReady := m.tunnelReady.Load()
 	capacity := m.currentCapacitySnapshot()
 
+	resourceMetrics := map[string]any{
+		"cpu":                    cpuVal,
+		"memory":                 memVal,
+		"memory_total_mb":        totalMB,
+		"current_running_agents": capacity.CurrentRunningAgents,
+		"max_parallel_agents":    capacity.MaxParallelAgents,
+		"tunnel_ready":           tunnelReady,
+		"reauth_required":        authRequired,
+	}
+	if reauthSessionID != "" {
+		resourceMetrics["reauth_session_id"] = reauthSessionID
+	}
+
 	payload := map[string]any{
-		"resource_metrics": map[string]any{
-			"cpu":                    cpuVal,
-			"memory":                 memVal,
-			"memory_total_mb":        totalMB,
-			"current_running_agents": capacity.CurrentRunningAgents,
-			"max_parallel_agents":    capacity.MaxParallelAgents,
-			"tunnel_ready":           tunnelReady,
-		},
-		"manager_version": currentManagerVersion(),
-		"platform":        runtime.GOOS,
-		"install_channel": currentInstallChannel(),
+		"resource_metrics": resourceMetrics,
+		"manager_version":  currentManagerVersion(),
+		"platform":         runtime.GOOS,
+		"install_channel":  currentInstallChannel(),
 	}
 	if tunnelReady && m.tunnelID != "" {
 		payload["tunnel_id"] = m.tunnelID
 	}
-	return m.managerRequestJSON(ctx, http.MethodPatch, "/api/managers/"+managerID+"/heartbeat", payload, nil)
+	if err := m.managerRequestJSON(ctx, http.MethodPatch, "/api/managers/"+managerID+"/heartbeat", payload, nil); err != nil {
+		return err
+	}
+	m.logHeartbeatState(managerID, tunnelReady, m.tunnelID != "", capacity.CurrentRunningAgents, capacity.MaxParallelAgents, authRequired)
+	return nil
+}
+
+func (m *manager) logHeartbeatState(managerID string, tunnelReady, tunnelIDPresent bool, runningAgents, maxAgents int, authRequired bool) {
+	now := time.Now()
+	m.mu.Lock()
+	shouldLog := m.lastHeartbeatLogAt.IsZero() ||
+		m.lastHeartbeatTunnelReady != tunnelReady ||
+		now.Sub(m.lastHeartbeatLogAt) >= 5*time.Minute
+	m.lastHeartbeatTunnelReady = tunnelReady
+	if shouldLog {
+		m.lastHeartbeatLogAt = now
+	}
+	m.mu.Unlock()
+	if !shouldLog {
+		return
+	}
+	m.logInfo(
+		"manager_heartbeat_ok manager_id=%s tunnel_ready=%t tunnel_id_present=%t running_agents=%d max_agents=%d auth_required=%t",
+		managerID,
+		tunnelReady,
+		tunnelIDPresent,
+		runningAgents,
+		maxAgents,
+		authRequired,
+	)
 }
 
 func (m *manager) pollLoop(ctx context.Context) {
@@ -3640,6 +3832,11 @@ func (m *manager) syncLessonsForAgent(agentID string) {
 	if agentID == "" {
 		return
 	}
+	if _, err := uuid.Parse(agentID); err != nil {
+		m.logWarn("lessons_sync_skipped agent_id=%s reason=invalid_persona_id err=%v", agentID, err)
+		return
+	}
+	m.logInfo("lessons_sync_queued agent_id=%s", agentID)
 	go func() {
 		syncCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
@@ -3699,8 +3896,13 @@ func (m *manager) syncLessonsForPersonaIDs(ctx context.Context, personaIDs []str
 	}
 
 	if len(payload.Personas) == 0 {
+		if len(filteredIDs) > 0 {
+			m.logInfo("lessons_sync_skipped persona_ids=%d reason=no_content_changes", len(filteredIDs))
+		}
 		return nil
 	}
+
+	m.logInfo("lessons_sync_started personas=%d", len(payload.Personas))
 
 	var response lessonsSyncResponse
 	if err := m.userRequestJSON(
@@ -3742,6 +3944,11 @@ func (m *manager) syncLessonsForPersonaIDs(ctx context.Context, personaIDs []str
 			continue
 		}
 		m.updatePersonaLessonHash(row.AgentPersonaID, row.ContentHash)
+		m.logInfo(
+			"lessons_sync_succeeded persona_id=%s content_hash=%s",
+			row.AgentPersonaID,
+			row.ContentHash,
+		)
 	}
 
 	return nil
@@ -3755,30 +3962,7 @@ func (m *manager) pullLessonsOnce(ctx context.Context) error {
 	}
 
 	for _, item := range exports {
-		content := "# Lessons Learned\n\n"
-		if len(item.Lessons) == 0 {
-			content += "- (none yet)\n"
-		} else {
-			for _, lesson := range item.Lessons {
-				lesson = strings.TrimSpace(lesson)
-				if lesson == "" {
-					continue
-				}
-				content += "- " + lesson + "\n"
-			}
-		}
-
-		path, err := m.lessonFilePath(item.AgentPersonaID)
-		if err != nil {
-			m.logError(
-				"lessons_pull_path_error persona_id=%s persona_name=%s err=%v",
-				item.AgentPersonaID,
-				item.PersonaName,
-				err,
-			)
-			continue
-		}
-		if err := writeFileAtomic(path, []byte(content), 0o600, 0o700); err != nil {
+		if err := m.replacePersonaLessonsInGlobalJSONL(item.AgentPersonaID, item.Lessons, "BACKEND"); err != nil {
 			m.logError(
 				"lessons_pull_write_error persona_id=%s persona_name=%s err=%v",
 				item.AgentPersonaID,
@@ -3787,7 +3971,11 @@ func (m *manager) pullLessonsOnce(ctx context.Context) error {
 			)
 			continue
 		}
-
+		content, _, err := m.loadPersonaLessonsFile(item.AgentPersonaID)
+		if err != nil {
+			m.logError("lessons_pull_hash_error persona_id=%s persona_name=%s err=%v", item.AgentPersonaID, item.PersonaName, err)
+			continue
+		}
 		sum := sha256.Sum256([]byte(content))
 		hash := fmt.Sprintf("%x", sum[:])
 		m.updatePersonaLessonHash(item.AgentPersonaID, hash)
@@ -3818,27 +4006,41 @@ func (m *manager) updatePersonaLessonHash(agentPersonaID, contentHash string) {
 }
 
 func (m *manager) loadPersonaLessonsFile(personaID string) (string, string, error) {
-	path, err := m.lessonFilePath(personaID)
-	if err != nil {
-		return "", "", err
+	personaID = strings.TrimSpace(personaID)
+	if personaID == "" {
+		return "", "", fmt.Errorf("missing persona id")
 	}
+	if _, err := uuid.Parse(personaID); err != nil {
+		return "", "", fmt.Errorf("invalid persona id: %w", err)
+	}
+	path := m.lessonsJSONLPath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", "", err
 	}
-
-	initial := []byte("# Lessons Learned\n\n- (none yet)\n")
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		if err := writeFileAtomic(path, initial, 0o600, 0o700); err != nil {
+		if err := writeFileAtomic(path, nil, 0o600, 0o700); err != nil {
 			return "", "", err
 		}
 	}
 
-	raw, err := os.ReadFile(path)
+	records, err := m.loadGlobalLessonRecords()
 	if err != nil {
 		return "", "", err
 	}
-	content := string(raw)
-	sum := sha256.Sum256(raw)
+	var builder strings.Builder
+	for _, record := range records {
+		if strings.TrimSpace(record.AgentPersonaID) != personaID {
+			continue
+		}
+		raw, err := json.Marshal(record)
+		if err != nil {
+			return "", "", err
+		}
+		builder.Write(raw)
+		builder.WriteByte('\n')
+	}
+	content := builder.String()
+	sum := sha256.Sum256([]byte(content))
 	return content, fmt.Sprintf("%x", sum[:]), nil
 }
 
@@ -3850,7 +4052,215 @@ func (m *manager) lessonFilePath(personaID string) (string, error) {
 	if _, err := uuid.Parse(personaID); err != nil {
 		return "", fmt.Errorf("invalid persona id: %w", err)
 	}
-	return filepath.Join(m.cfg.LessonsBaseDir, personaID, "lessons.md"), nil
+	return filepath.Join(m.cfg.LessonsBaseDir, personaID, "lessons.jsonl"), nil
+}
+
+func (m *manager) lessonsJSONLPath() string {
+	path := strings.TrimSpace(m.cfg.LessonsJSONLFile)
+	if path != "" {
+		return path
+	}
+	baseDir := strings.TrimSpace(m.cfg.LessonsBaseDir)
+	if baseDir == "" {
+		return "lessons.jsonl"
+	}
+	return filepath.Join(filepath.Dir(baseDir), "lessons.jsonl")
+}
+
+func (m *manager) loadGlobalLessonRecords() ([]lessonJSONLRecord, error) {
+	path := m.lessonsJSONLPath()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	records := make([]lessonJSONLRecord, 0)
+	for _, line := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var record lessonJSONLRecord
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			continue
+		}
+		record.AgentPersonaID = strings.TrimSpace(record.AgentPersonaID)
+		record.Lesson = strings.TrimSpace(record.Lesson)
+		record.Source = strings.TrimSpace(record.Source)
+		record.CreatedAt = strings.TrimSpace(record.CreatedAt)
+		if record.AgentPersonaID == "" || record.Lesson == "" {
+			continue
+		}
+		records = append(records, record)
+	}
+	return records, nil
+}
+
+func (m *manager) writeGlobalLessonRecords(records []lessonJSONLRecord) error {
+	path := m.lessonsJSONLPath()
+	var builder strings.Builder
+	for _, record := range records {
+		record.AgentPersonaID = strings.TrimSpace(record.AgentPersonaID)
+		record.Lesson = strings.TrimSpace(record.Lesson)
+		record.Source = strings.TrimSpace(record.Source)
+		record.CreatedAt = strings.TrimSpace(record.CreatedAt)
+		if record.AgentPersonaID == "" || record.Lesson == "" {
+			continue
+		}
+		raw, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		builder.Write(raw)
+		builder.WriteByte('\n')
+	}
+	return writeFileAtomic(path, []byte(builder.String()), 0o600, 0o700)
+}
+
+func (m *manager) appendPersonaLessonsToGlobalJSONL(agentID string, lessons []string, source string) (bool, error) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return false, fmt.Errorf("missing persona id")
+	}
+	if _, err := uuid.Parse(agentID); err != nil {
+		return false, fmt.Errorf("invalid persona id: %w", err)
+	}
+	records, err := m.loadGlobalLessonRecords()
+	if err != nil {
+		return false, err
+	}
+	seen := map[string]struct{}{}
+	for _, record := range records {
+		if strings.TrimSpace(record.AgentPersonaID) != agentID {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(record.Lesson))
+		if key != "" {
+			seen[key] = struct{}{}
+		}
+	}
+	changed := false
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, lesson := range lessons {
+		lesson = strings.TrimSpace(lesson)
+		if lesson == "" {
+			continue
+		}
+		key := strings.ToLower(lesson)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		records = append(records, lessonJSONLRecord{
+			AgentPersonaID: agentID,
+			Lesson:         lesson,
+			Source:         strings.TrimSpace(source),
+			CreatedAt:      now,
+		})
+		changed = true
+	}
+	if !changed {
+		return false, nil
+	}
+	return true, m.writeGlobalLessonRecords(records)
+}
+
+func (m *manager) replacePersonaLessonsInGlobalJSONL(agentID string, lessons []string, source string) error {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return fmt.Errorf("missing persona id")
+	}
+	if _, err := uuid.Parse(agentID); err != nil {
+		return fmt.Errorf("invalid persona id: %w", err)
+	}
+	records, err := m.loadGlobalLessonRecords()
+	if err != nil {
+		return err
+	}
+	next := make([]lessonJSONLRecord, 0, len(records)+len(lessons))
+	for _, record := range records {
+		if strings.TrimSpace(record.AgentPersonaID) == agentID {
+			continue
+		}
+		next = append(next, record)
+	}
+	seen := map[string]struct{}{}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, lesson := range lessons {
+		lesson = strings.TrimSpace(lesson)
+		if lesson == "" {
+			continue
+		}
+		key := strings.ToLower(lesson)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		next = append(next, lessonJSONLRecord{
+			AgentPersonaID: agentID,
+			Lesson:         lesson,
+			Source:         strings.TrimSpace(source),
+			CreatedAt:      now,
+		})
+	}
+	return m.writeGlobalLessonRecords(next)
+}
+
+func (m *manager) persistWorkerLessonsToPersona(agentID, workingDir string) error {
+	agentID = strings.TrimSpace(agentID)
+	workingDir = strings.TrimSpace(workingDir)
+	if agentID == "" || workingDir == "" {
+		return nil
+	}
+
+	workspaceLessonsPath := filepath.Join(workingDir, "lessons.jsonl")
+	workspaceRaw, err := os.ReadFile(workspaceLessonsPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
+	workspaceLines, err := extractLessonJSONLLines(string(workspaceRaw))
+	if err != nil {
+		return fmt.Errorf("parse workspace lessons jsonl: %w", err)
+	}
+	if len(workspaceLines) == 0 {
+		return nil
+	}
+	changed, err := m.appendPersonaLessonsToGlobalJSONL(agentID, workspaceLines, "AGENT")
+	if err != nil {
+		return err
+	}
+	if !changed {
+		m.logInfo(
+			"lessons_copyback_skipped agent_id=%s working_dir=%s reason=no_new_lessons",
+			agentID,
+			workingDir,
+		)
+		return nil
+	}
+
+	m.logInfo(
+		"lessons_copyback_merged agent_id=%s working_dir=%s destination=%s",
+		agentID,
+		workingDir,
+		m.lessonsJSONLPath(),
+	)
+	return nil
+}
+
+func (m *manager) persistAndSyncWorkerLessons(w *worker) {
+	if w == nil {
+		return
+	}
+	if err := m.persistWorkerLessonsToPersona(w.agentID, w.workingDir); err != nil {
+		m.logError("persist_worker_lessons_error instance_id=%s agent_id=%s err=%v", w.instanceID, w.agentID, err)
+	}
+	m.syncLessonsForAgent(w.agentID)
 }
 
 func (m *manager) personaFilePath(personaID string) (string, error) {
@@ -4045,14 +4455,22 @@ func writePollSnapshot(path string, personas []apiAgentPersona, tasks []apiTask)
 
 func choosePersonaForTask(personas []apiAgentPersona, task apiTask) *apiAgentPersona {
 	if len(task.EligibleAgentIDs) == 0 {
-		return &personas[0]
+		for i := range personas {
+			if strings.TrimSpace(personas[i].RuntimeID) != "" {
+				return &personas[i]
+			}
+		}
+		return nil
 	}
 	allowed := map[string]struct{}{}
 	for _, id := range task.EligibleAgentIDs {
-		allowed[id] = struct{}{}
+		allowed[strings.TrimSpace(id)] = struct{}{}
 	}
 	for i := range personas {
-		if _, ok := allowed[personas[i].ID]; ok {
+		if strings.TrimSpace(personas[i].RuntimeID) == "" {
+			continue
+		}
+		if _, ok := allowed[strings.TrimSpace(personas[i].ID)]; ok {
 			return &personas[i]
 		}
 	}
@@ -4094,7 +4512,11 @@ func (m *manager) spawnWorkerWithWorkingDir(
 		m.mu.Unlock()
 	}
 
-	claimPayload := map[string]string{"taskId": task.ID, "agentId": persona.ID}
+	claimPayload := map[string]string{
+		"taskId":           task.ID,
+		"agentId":          persona.ID,
+		"workingDirectory": workingDir,
+	}
 	var claimOut struct {
 		Claimed bool `json:"claimed"`
 	}
@@ -4139,6 +4561,13 @@ func (m *manager) spawnWorkerWithWorkingDir(
 			workingDir,
 		)
 	}
+	if err := m.updateTaskMetadataStatus(task.ID, "IN_PROGRESS", taskMetadata{
+		AgentID:    persona.ID,
+		InstanceID: instanceID,
+		WorkingDir: workingDir,
+	}); err != nil {
+		m.logWarn("task_metadata_update_failed task_id=%s status=IN_PROGRESS err=%v", task.ID, err)
+	}
 	m.logInfo("task_status_updated task_id=%s status=IN_PROGRESS", task.ID)
 
 	checkpoints, checkpointsErr := m.fetchTaskCheckpoints(ctx, task.ID, 5)
@@ -4148,7 +4577,7 @@ func (m *manager) spawnWorkerWithWorkingDir(
 	lessonsContent, _, lessonsLoadErr := m.loadPersonaLessonsFile(persona.ID)
 	if lessonsLoadErr != nil {
 		m.logError("lessons_file_load_error agent_id=%s err=%v", persona.ID, lessonsLoadErr)
-		lessonsContent = defaultLessonsDocument()
+		lessonsContent = ""
 	}
 	personaFilePath, lessonsFilePath, taskContextFilePath, workspaceFilesErr := writeTaskWorkspaceFiles(
 		workingDir,
@@ -4185,6 +4614,8 @@ func (m *manager) spawnWorkerWithWorkingDir(
 		ctx,
 		instanceID,
 		task.ID,
+		task.Name,
+		"IN_PROGRESS",
 		persona.ID,
 		sessionID,
 		workingDir,
@@ -4239,7 +4670,7 @@ func (m *manager) spawnWorkerWithWorkingDir(
 
 func (m *manager) startBootstrapWorker(
 	ctx context.Context,
-	instanceID, taskID, agentID, sessionID, workingDir, runtimeCommand, launchCommand string,
+	instanceID, taskID, taskName, taskStatus, agentID, sessionID, workingDir, runtimeCommand, launchCommand string,
 ) (*worker, error) {
 	var lastErr error
 	for attempt := 1; attempt <= 2; attempt++ {
@@ -4247,6 +4678,8 @@ func (m *manager) startBootstrapWorker(
 			ctx,
 			instanceID,
 			taskID,
+			taskName,
+			taskStatus,
 			agentID,
 			sessionID,
 			workingDir,
@@ -4385,7 +4818,7 @@ func buildPersonaPrompt(
 ) string {
 	parts := []string{
 		"# Session Start",
-		"- Read AGENT_PERSONA.md, lessons.md, and TASK_CONTEXT.md before doing anything else.",
+		"- Read AGENT_PERSONA.md, lessons.jsonl, and TASK_CONTEXT.md before doing anything else.",
 	}
 	if strings.TrimSpace(personaFilePath) != "" {
 		parts = append(parts, "- Persona file: "+strings.TrimSpace(personaFilePath))
@@ -4426,17 +4859,27 @@ func buildPersonaDocument(persona apiAgentPersona, lessonsFilePath string) strin
 		lessonSection = "## Persona Lessons\n" + strings.Join(lessonLines, "\n")
 	}
 
+	operatingPrinciples := []string{
+		"- Prefer correctness over speed; state assumptions and ask when ambiguous.",
+		"- For bug reports, start with a failing repro test when practical.",
+		"- Plan non-trivial work as verifiable steps; keep changes surgical.",
+		"- Touch only files needed for the task; match existing style.",
+		"- Never read or print env vars, tokens, or secrets.",
+		"- Verify before done with focused tests or logs and report what ran.",
+		"- Work only in the assigned working directory unless the task asks otherwise.",
+	}
+
 	selfImprovementLines := []string{
 		"- Read this file at the start of every session.",
-		"- If the user corrects you or you discover a durable mistake pattern, update lessons.md before finishing the task.",
+		"- If the user corrects you or you discover a durable mistake pattern, append a JSON object with a lesson field to lessons.jsonl before finishing the task.",
 		"- Do not add duplicate lessons.",
 		"- Keep lessons short, concrete, and action-oriented.",
 	}
 	if strings.TrimSpace(lessonsFilePath) != "" {
 		selfImprovementLines = append([]string{
 			"- Lessons file: " + strings.TrimSpace(lessonsFilePath),
-			"- Review relevant lessons from lessons.md before starting implementation.",
-			"- Write new lessons directly into lessons.md when you learn something durable.",
+			"- Review relevant lessons from lessons.jsonl before starting implementation.",
+			"- Write each new lesson as one JSON object per line, for example {\"lesson\":\"Keep fixes small.\"}.",
 		}, selfImprovementLines...)
 	}
 
@@ -4448,13 +4891,37 @@ func buildPersonaDocument(persona apiAgentPersona, lessonsFilePath string) strin
 		section("Do and Do Not Rules", persona.Guardrails),
 		section("Examples", persona.Examples),
 		lessonSection,
+		"## Operating Principles\n" + strings.Join(operatingPrinciples, "\n"),
 		"## Self-Improvement Loop\n" + strings.Join(selfImprovementLines, "\n"),
 	}
 	return strings.Join(parts, "\n\n") + "\n"
 }
 
-func defaultLessonsDocument() string {
-	return "# Lessons Learned\n\n- (none yet)\n"
+func extractLessonJSONLLines(content string) ([]string, error) {
+	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	out := make([]string, 0, len(lines))
+	seen := make(map[string]struct{}, len(lines))
+	for idx, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		var record lessonJSONLRecord
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			return nil, fmt.Errorf("line %d: %w", idx+1, err)
+		}
+		line = strings.TrimSpace(record.Lesson)
+		if line == "" || len(line) < 4 {
+			continue
+		}
+		key := strings.ToLower(line)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, line)
+	}
+	return out, nil
 }
 
 func buildTaskContextDocument(
@@ -4516,12 +4983,11 @@ func writeTaskWorkspaceFiles(
 	}
 
 	lessonsContent = strings.TrimSpace(lessonsContent)
-	if lessonsContent == "" {
-		lessonsContent = strings.TrimSpace(defaultLessonsDocument())
+	if lessonsContent != "" {
+		lessonsContent += "\n"
 	}
-	lessonsContent += "\n"
 
-	lessonsPath := filepath.Join(workingDir, "lessons.md")
+	lessonsPath := filepath.Join(workingDir, "lessons.jsonl")
 	if err := writeFileAtomic(lessonsPath, []byte(lessonsContent), 0o600, 0o700); err != nil {
 		return "", "", "", err
 	}
@@ -4576,7 +5042,7 @@ func localInstanceFilePaths(stateFilePath, instanceID string) (baseDir, logPath,
 
 func (m *manager) startWorkerProcess(
 	ctx context.Context,
-	instanceID, taskID, agentID, sessionID, workingDir, runtimeCommand, launchCommand string,
+	instanceID, taskID, taskName, taskStatus, agentID, sessionID, workingDir, runtimeCommand, launchCommand string,
 ) (*worker, error) {
 	cmd := newRuntimeCommand(launchCommand)
 	cmd.Dir = workingDir
@@ -4645,6 +5111,8 @@ func (m *manager) startWorkerProcess(
 	w := &worker{
 		instanceID:              instanceID,
 		taskID:                  taskID,
+		taskName:                strings.TrimSpace(taskName),
+		taskStatus:              strings.TrimSpace(taskStatus),
 		agentID:                 agentID,
 		sessionID:               sessionID,
 		workingDir:              workingDir,
@@ -5249,14 +5717,7 @@ func (m *manager) scanLifecycleMarkers(ctx context.Context, w *worker, chunk str
 		}
 		w.pendingTaskCompleted = ""
 		w.pendingTaskCompletedAt = time.Time{}
-		payload := m.lifecycleTaskUpdatePayload(w, event.status, event.comment)
-		if err := m.managerRequestJSON(
-			ctx,
-			http.MethodPost,
-			"/agent-instances/"+w.instanceID+"/update-task",
-			payload,
-			nil,
-		); err != nil {
+		if err := m.updateTaskStatusFromLifecycle(ctx, w, event.status, event.comment); err != nil {
 			m.logError("lifecycle_marker_update_error instance_id=%s marker=%s err=%v", w.instanceID, event.marker, err)
 			return
 		}
@@ -5272,6 +5733,7 @@ func (m *manager) scanLifecycleMarkers(ctx context.Context, w *worker, chunk str
 		}
 		w.pendingTaskCompleted = event.comment
 		w.pendingTaskCompletedAt = time.Now()
+		w.pendingTaskCompletedRetryAt = time.Time{}
 	}
 }
 
@@ -5289,11 +5751,64 @@ func (m *manager) flushPendingTaskCompleted(
 	if !force && time.Since(w.pendingTaskCompletedAt) < taskCompletedGrace {
 		return
 	}
-	payload := m.lifecycleTaskUpdatePayload(
-		w,
-		"READY_FOR_REVIEW",
-		w.pendingTaskCompleted,
-	)
+	if !force && !w.pendingTaskCompletedRetryAt.IsZero() && time.Now().Before(w.pendingTaskCompletedRetryAt) {
+		return
+	}
+	if err := m.updateTaskStatusFromLifecycle(ctx, w, "READY_FOR_REVIEW", w.pendingTaskCompleted); err != nil {
+		retryDelay := lifecycleUpdateRetryDelay(err)
+		w.pendingTaskCompletedRetryAt = time.Now().Add(retryDelay)
+		m.logError("lifecycle_marker_update_error instance_id=%s marker=TASK_COMPLETED retry_in=%s err=%v", w.instanceID, retryDelay.Round(time.Second), err)
+		if force {
+			retrySleep := retryDelay
+			if retrySleep > 15*time.Second {
+				retrySleep = 15 * time.Second
+			}
+			if sleepWithContext(ctx, retrySleep) {
+				w.pendingTaskCompletedRetryAt = time.Time{}
+				m.flushPendingTaskCompleted(ctx, w, false)
+			}
+		}
+		return
+	}
+	w.sawTaskCompleted = true
+	w.pendingTaskCompleted = ""
+	w.pendingTaskCompletedAt = time.Time{}
+	w.pendingTaskCompletedRetryAt = time.Time{}
+	m.persistAndSyncWorkerLessons(w)
+	m.logInfo("lifecycle_marker instance_id=%s marker=TASK_COMPLETED", w.instanceID)
+}
+
+func (m *manager) updateTaskStatusFromLifecycle(ctx context.Context, w *worker, status, comment string) error {
+	if w == nil {
+		return fmt.Errorf("missing worker")
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return fmt.Errorf("missing lifecycle status")
+	}
+	if strings.TrimSpace(w.taskStatus) == status {
+		m.logInfo("lifecycle_marker_update_skipped instance_id=%s task_id=%s status=%s reason=already_known", w.instanceID, w.taskID, status)
+		return nil
+	}
+	if lifecycleStatusAlreadyKnown(w.taskStatus, status) {
+		m.logInfo("lifecycle_marker_update_skipped instance_id=%s task_id=%s status=%s current_status=%s reason=already_satisfied", w.instanceID, w.taskID, status, w.taskStatus)
+		return nil
+	}
+	metadataStatus := m.taskMetadataStatus(w.taskID)
+	if metadataStatus == status {
+		w.taskStatus = status
+		m.logInfo("lifecycle_marker_update_skipped instance_id=%s task_id=%s status=%s reason=metadata_already_known", w.instanceID, w.taskID, status)
+		return nil
+	}
+	if metadataStatus != "" {
+		backendStatus := m.refreshTaskMetadataStatus(ctx, w)
+		if lifecycleStatusAlreadyKnown(backendStatus, status) {
+			w.taskStatus = status
+			m.logInfo("lifecycle_marker_update_skipped instance_id=%s task_id=%s status=%s backend_status=%s reason=backend_already_known", w.instanceID, w.taskID, status, backendStatus)
+			return nil
+		}
+	}
+	payload := m.lifecycleTaskUpdatePayload(w, status, comment)
 	if err := m.managerRequestJSON(
 		ctx,
 		http.MethodPost,
@@ -5301,18 +5816,72 @@ func (m *manager) flushPendingTaskCompleted(
 		payload,
 		nil,
 	); err != nil {
-		m.logError("lifecycle_marker_update_error instance_id=%s marker=TASK_COMPLETED err=%v", w.instanceID, err)
-		if force {
-			w.pendingTaskCompleted = ""
-			w.pendingTaskCompletedAt = time.Time{}
-		}
-		return
+		return err
 	}
-	w.sawTaskCompleted = true
-	w.pendingTaskCompleted = ""
-	w.pendingTaskCompletedAt = time.Time{}
-	m.syncLessonsForAgent(w.agentID)
-	m.logInfo("lifecycle_marker instance_id=%s marker=TASK_COMPLETED", w.instanceID)
+	w.taskStatus = status
+	if err := m.updateTaskMetadataStatus(w.taskID, status, taskMetadata{
+		AgentID:    w.agentID,
+		InstanceID: w.instanceID,
+		WorkingDir: w.workingDir,
+	}); err != nil {
+		m.logWarn("task_metadata_update_failed task_id=%s status=%s err=%v", w.taskID, status, err)
+	}
+	return nil
+}
+
+func lifecycleStatusAlreadyKnown(currentStatus, requestedStatus string) bool {
+	currentStatus = strings.TrimSpace(currentStatus)
+	requestedStatus = strings.TrimSpace(requestedStatus)
+	if currentStatus == "" || requestedStatus == "" {
+		return false
+	}
+	if currentStatus == requestedStatus {
+		return true
+	}
+	if requestedStatus == "READY_FOR_REVIEW" {
+		return currentStatus == "DONE"
+	}
+	if requestedStatus == "WAITING_FOR_USER_INPUT" {
+		return currentStatus == "READY_FOR_REVIEW" || currentStatus == "DONE"
+	}
+	return false
+}
+
+func (m *manager) refreshTaskMetadataStatus(ctx context.Context, w *worker) string {
+	if w == nil || strings.TrimSpace(w.taskID) == "" {
+		return ""
+	}
+	var task struct {
+		ID               string `json:"id"`
+		Status           string `json:"status"`
+		AssignedInstance string `json:"assigned_agent_instance_id"`
+		WorkingDirectory string `json:"working_directory"`
+	}
+	if err := m.userRequestJSON(ctx, http.MethodGet, "/tasks/"+url.PathEscape(strings.TrimSpace(w.taskID)), nil, &task); err != nil {
+		m.logWarn("task_metadata_refresh_failed task_id=%s err=%v", w.taskID, err)
+		return ""
+	}
+	status := strings.TrimSpace(task.Status)
+	if status == "" {
+		return ""
+	}
+	if err := m.updateTaskMetadataStatus(w.taskID, status, taskMetadata{
+		AgentID:    w.agentID,
+		InstanceID: firstNonEmpty(w.instanceID, task.AssignedInstance),
+		WorkingDir: firstNonEmpty(w.workingDir, task.WorkingDirectory),
+	}); err != nil {
+		m.logWarn("task_metadata_update_failed task_id=%s status=%s err=%v", w.taskID, status, err)
+	}
+	return status
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func (m *manager) lifecycleTaskUpdatePayload(w *worker, status, comment string) map[string]string {
@@ -5337,31 +5906,14 @@ func (m *manager) lifecycleTaskUpdatePayload(w *worker, status, comment string) 
 }
 
 func (m *manager) batchLogsLoop(ctx context.Context, w *worker) {
-	ticker := time.NewTicker(m.cfg.LogFlushInterval)
-	defer ticker.Stop()
-	batch := make([]logEntry, 0, m.cfg.LogFlushBatchSize)
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		payload := map[string]any{"agent_instance_id": w.instanceID, "session_id": w.sessionID, "logs": batch}
-		_ = m.managerRequestJSON(ctx, http.MethodPost, "/api/logs/batch", payload, nil)
-		batch = batch[:0]
-	}
+	_ = ctx
 	for {
 		select {
 		case entry := <-w.logs:
 			if entry.LogType == "user" || entry.LogType == "assistant" {
 				_ = appendTranscriptLocalLogEntry(w.localTranscriptFilePath, entry)
 			}
-			batch = append(batch, entry)
-			if len(batch) >= m.cfg.LogFlushBatchSize {
-				flush()
-			}
-		case <-ticker.C:
-			flush()
 		case <-w.stopBatch:
-			flush()
 			return
 		}
 	}
@@ -6196,6 +6748,9 @@ func isRealtimeHandshakeAuthError(err error) bool {
 }
 
 func (m *manager) refreshRealtimeHandshakeState(ctx context.Context, dialErr error) error {
+	if isLoginRequiredCLIError(dialErr) {
+		return m.beginManagerReauthWithHeartbeat(ctx, true)
+	}
 	if !isRealtimeHandshakeAuthError(dialErr) {
 		return nil
 	}
@@ -6218,6 +6773,59 @@ func sleepWithContext(ctx context.Context, delay time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+func lifecycleUpdateRetryDelay(err error) time.Duration {
+	if err == nil {
+		return lifecycleUpdateRetryDefault
+	}
+	msg := err.Error()
+	if retryAfter, ok := parseRetryAfterSeconds(msg); ok {
+		return clampLifecycleRetryDelay(time.Duration(retryAfter)*time.Second + time.Second)
+	}
+	status := parseHTTPStatusFromError(msg)
+	switch {
+	case status == http.StatusTooManyRequests:
+		return 10 * time.Second
+	case status >= 500:
+		return 5 * time.Second
+	default:
+		return lifecycleUpdateRetryDefault
+	}
+}
+
+func parseRetryAfterSeconds(msg string) (int, bool) {
+	matches := regexp.MustCompile(`"?retryAfterSeconds"?\s*[:=]\s*(\d+)`).FindStringSubmatch(msg)
+	if len(matches) != 2 {
+		return 0, false
+	}
+	seconds, err := strconv.Atoi(matches[1])
+	if err != nil || seconds <= 0 {
+		return 0, false
+	}
+	return seconds, true
+}
+
+func parseHTTPStatusFromError(msg string) int {
+	matches := regexp.MustCompile(`status=(\d{3})`).FindStringSubmatch(msg)
+	if len(matches) != 2 {
+		return 0
+	}
+	status, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return 0
+	}
+	return status
+}
+
+func clampLifecycleRetryDelay(delay time.Duration) time.Duration {
+	if delay < lifecycleUpdateRetryMin {
+		return lifecycleUpdateRetryMin
+	}
+	if delay > lifecycleUpdateRetryMax {
+		return lifecycleUpdateRetryMax
+	}
+	return delay
 }
 
 func (m *manager) monitorWorkerExit(w *worker) {
@@ -6257,6 +6865,11 @@ func (m *manager) monitorWorkerExit(w *worker) {
 		comment = fmt.Sprintf("Agent process failed: %v\nLast output:\n%s", err, summary)
 	}
 
+	shutdownRequested, _, shutdownMode := w.shutdownRequestDetails()
+	if shutdownRequested {
+		m.persistAndSyncWorkerLessons(w)
+	}
+
 	if w.sawTaskCompleted || w.sawNeedsUserInput {
 		m.mu.Lock()
 		delete(m.workers, w.instanceID)
@@ -6271,7 +6884,7 @@ func (m *manager) monitorWorkerExit(w *worker) {
 		return
 	}
 
-	if shutdownRequested, _, shutdownMode := w.shutdownRequestDetails(); shutdownRequested {
+	if shutdownRequested {
 		if shutdownMode == shutdownModeManagerRestart {
 			persistedStatus := workerAgentStatusForWorker(w)
 			if persistedStatus == "" {
@@ -6314,20 +6927,14 @@ func (m *manager) monitorWorkerExit(w *worker) {
 			m.logInfo("instance_exit instance_id=%s status=%s restartable=true", w.instanceID, status)
 			return
 		}
-		comment = "Agent was shut down after being asked to persist progress to TASK_CONTEXT.md and lessons to lessons.md."
+		comment = "Agent was shut down after being asked to persist progress to TASK_CONTEXT.md and lessons to lessons.jsonl."
 		if shutdownMode == shutdownModeIdleTimeout {
 			comment = "Agent was shut down after being idle with no activity for 10 minutes. Progress persisted to TASK_CONTEXT.md."
 		}
 		if summary != "" {
 			comment += "\nLast output:\n" + summary
 		}
-		payload := m.lifecycleTaskUpdatePayload(
-			w,
-			"WAITING_FOR_USER_INPUT",
-			comment,
-		)
-		_ = m.managerRequestJSON(context.Background(), http.MethodPost, "/agent-instances/"+w.instanceID+"/update-task", payload, nil)
-		m.syncLessonsForAgent(w.agentID)
+		_ = m.updateTaskStatusFromLifecycle(context.Background(), w, "WAITING_FOR_USER_INPUT", comment)
 
 		m.mu.Lock()
 		delete(m.workers, w.instanceID)
@@ -6342,15 +6949,11 @@ func (m *manager) monitorWorkerExit(w *worker) {
 		return
 	}
 
-	statusUpdate := "READY_FOR_REVIEW"
 	if err != nil {
-		statusUpdate = "WAITING_FOR_USER_INPUT"
-	}
-
-	payload := m.lifecycleTaskUpdatePayload(w, statusUpdate, comment)
-	_ = m.managerRequestJSON(context.Background(), http.MethodPost, "/agent-instances/"+w.instanceID+"/update-task", payload, nil)
-	if err == nil {
-		m.syncLessonsForAgent(w.agentID)
+		_ = m.updateTaskStatusFromLifecycle(context.Background(), w, "WAITING_FOR_USER_INPUT", comment)
+	} else if strings.TrimSpace(w.pendingTaskCompleted) != "" && !w.pendingTaskCompletedAt.IsZero() {
+		_ = m.updateTaskStatusFromLifecycle(context.Background(), w, "READY_FOR_REVIEW", w.pendingTaskCompleted)
+		m.persistAndSyncWorkerLessons(w)
 	}
 
 	m.mu.Lock()
@@ -6538,6 +7141,7 @@ func (m *manager) getFreshStoredSession(ctx context.Context, forceRefresh bool) 
 		return storedSession{}, fmt.Errorf("no stored session; run 'passiveagents login' first")
 	}
 	if !forceRefresh && !sessionNeedsRefresh(session) {
+		m.clearManagerAuthRequiredIfSessionUsable(session, false)
 		return session, nil
 	}
 	initialSession := session
@@ -6545,17 +7149,26 @@ func (m *manager) getFreshStoredSession(ctx context.Context, forceRefresh bool) 
 	m.sessionRefreshMu.Lock()
 	defer m.sessionRefreshMu.Unlock()
 
+	releaseRefreshLock, err := acquireSessionRefreshLock()
+	if err != nil {
+		return storedSession{}, err
+	}
+	defer releaseRefreshLock()
+
 	session, err = m.loadSession()
 	if err != nil {
 		return storedSession{}, fmt.Errorf("no stored session; run 'passiveagents login' first")
 	}
 	if shouldReuseReloadedSession(forceRefresh, initialSession, session) {
+		m.clearManagerAuthRequiredIfSessionUsable(session, false)
 		return session, nil
 	}
 	if !forceRefresh && !sessionNeedsRefresh(session) {
+		m.clearManagerAuthRequiredIfSessionUsable(session, false)
 		return session, nil
 	}
 	if m.shouldReuseSessionDuringRefreshBackoff(forceRefresh, session) {
+		m.clearManagerAuthRequiredIfSessionUsable(session, false)
 		return session, nil
 	}
 
@@ -6571,43 +7184,25 @@ func (m *manager) getFreshStoredSession(ctx context.Context, forceRefresh bool) 
 						if err := m.saveSession(refreshed); err != nil {
 							return storedSession{}, err
 						}
+						m.clearManagerAuthRequiredIfSessionUsable(refreshed, false)
 						return refreshed, nil
 					}
 					session = reloaded
 					if !forceRefresh && isRefreshRateLimitError(err) && !sessionAccessTokenExpired(session) {
 						m.sessionRefreshRetryAt = time.Now().Add(sessionRefreshRateLimitBackoff)
+						m.clearManagerAuthRequiredIfSessionUsable(session, false)
 						return session, nil
 					}
 				}
 			}
-			if recovered, recoverErr := m.recoverManagerSession(ctx); recoverErr == nil {
-				m.logInfo("manager_session_recovery_succeeded manager_id=%s", strings.TrimSpace(m.state.ManagerID))
-				if err := m.saveSession(recovered); err != nil {
-					return storedSession{}, err
-				}
-				return recovered, nil
-			} else {
-				m.logWarn("manager_session_recovery_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), recoverErr)
-				if isStoredManagerSessionInvalidError(recoverErr) && !sessionAccessTokenExpired(session) {
-					if syncErr := m.syncManagerRegistration(ctx, session.AccessToken); syncErr == nil {
-						if recovered, retryErr := m.recoverManagerSession(ctx); retryErr == nil {
-							m.logInfo("manager_session_recovery_succeeded_after_reregister manager_id=%s", strings.TrimSpace(m.state.ManagerID))
-							if err := m.saveSession(recovered); err != nil {
-								return storedSession{}, err
-							}
-							return recovered, nil
-						} else {
-							m.logWarn("manager_session_recovery_retry_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), retryErr)
-						}
-					} else {
-						m.logWarn("manager_registration_resync_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), syncErr)
-					}
-				}
+			if reauthErr := m.beginManagerReauthWithHeartbeat(ctx, false); reauthErr != nil {
+				m.logWarn("manager_reauth_init_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), reauthErr)
 			}
 			return storedSession{}, wrapRefreshTokenError(err)
 		}
 		if !forceRefresh && isRefreshRateLimitError(err) && !sessionAccessTokenExpired(session) {
 			m.sessionRefreshRetryAt = time.Now().Add(sessionRefreshRateLimitBackoff)
+			m.clearManagerAuthRequiredIfSessionUsable(session, false)
 			return session, nil
 		}
 		return storedSession{}, err
@@ -6616,7 +7211,32 @@ func (m *manager) getFreshStoredSession(ctx context.Context, forceRefresh bool) 
 	if err := m.saveSession(refreshed); err != nil {
 		return storedSession{}, err
 	}
+	m.clearManagerAuthRequiredIfSessionUsable(refreshed, false)
+	if err := m.syncRegisteredManagerSession(ctx); err != nil {
+		m.logWarn("manager_session_sync_after_refresh_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), err)
+	}
 	return refreshed, nil
+}
+
+func (m *manager) clearManagerAuthRequiredIfSessionUsable(session storedSession, sendHeartbeat bool) {
+	if strings.TrimSpace(session.AccessToken) == "" || sessionAccessTokenExpired(session) {
+		return
+	}
+	m.mu.Lock()
+	hasPendingReauthSession := strings.TrimSpace(m.state.ReauthSessionID) != "" ||
+		strings.TrimSpace(m.state.ReauthCodeVerifier) != ""
+	needsClear := m.state.AuthRequired ||
+		hasPendingReauthSession
+	m.mu.Unlock()
+	if hasPendingReauthSession {
+		return
+	}
+	if !needsClear {
+		return
+	}
+	if err := m.updateManagerAuthStateWithHeartbeat(false, "", "", sendHeartbeat); err != nil {
+		m.logWarn("manager_auth_required_clear_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), err)
+	}
 }
 
 func (m *manager) saveSession(session storedSession) error {
@@ -6629,48 +7249,40 @@ func (m *manager) saveSession(session storedSession) error {
 	}
 	if err := keyringSet(keyringService, keyringUser, string(raw)); err != nil {
 		if keyringUnavailable(err) {
-			return writeFallbackSession(raw)
+			return writeStoredSession(raw)
 		}
 		return sanitizeKeyringError(err)
 	}
-	if err := writeFallbackSession(raw); err != nil {
-		m.logWarn("session_fallback_sync_warning err=%v", err)
-	}
+	_ = writeStoredSession(raw)
 	return nil
 }
 
 func (m *manager) loadSession() (storedSession, error) {
-	var (
-		keyringSession  storedSession
-		fallbackSession storedSession
-		keyringErr      error
-		fallbackErr     error
-	)
-
-	if raw, err := keyringGet(keyringService, keyringUser); err == nil {
-		keyringSession, keyringErr = decodeStoredSession([]byte(raw))
-	} else {
-		keyringErr = sanitizeKeyringError(err)
+	raw, err := keyringGet(keyringService, keyringUser)
+	if err == nil {
+		session, decodeErr := decodeStoredSession([]byte(raw))
+		if decodeErr != nil {
+			return storedSession{}, decodeErr
+		}
+		return session, nil
+	}
+	if !keyringUnavailable(err) && !keyringSessionMissing(err) {
+		return storedSession{}, sanitizeKeyringError(err)
 	}
 
-	if raw, err := readFallbackSession(); err == nil {
-		fallbackSession, fallbackErr = decodeStoredSession(raw)
-	} else {
-		fallbackErr = err
-	}
-
-	switch {
-	case keyringErr == nil && fallbackErr == nil:
-		return chooseNewerStoredSession(keyringSession, fallbackSession), nil
-	case keyringErr == nil:
-		return keyringSession, nil
-	case fallbackErr == nil:
-		return fallbackSession, nil
-	case keyringErr != nil:
-		return storedSession{}, keyringErr
-	default:
+	rawFallback, fallbackErr := readStoredSession()
+	if fallbackErr != nil {
+		if errors.Is(fallbackErr, os.ErrNotExist) {
+			return storedSession{}, fmt.Errorf("not logged in; run 'passiveagents login'")
+		}
 		return storedSession{}, fallbackErr
 	}
+
+	session, decodeErr := decodeStoredSession(rawFallback)
+	if decodeErr != nil {
+		return storedSession{}, decodeErr
+	}
+	return session, nil
 }
 
 func (m *manager) callRefreshSession(ctx context.Context, refreshToken string) (storedSession, error) {
@@ -6680,53 +7292,321 @@ func (m *manager) callRefreshSession(ctx context.Context, refreshToken string) (
 	return m.refreshSession(ctx, refreshToken)
 }
 
-func (m *manager) recoverManagerSession(ctx context.Context) (storedSession, error) {
-	managerID := strings.TrimSpace(m.state.ManagerID)
-	recoveryToken, tokenSource := loadManagerRecoveryTokenWithSource(m.state)
-	if managerID == "" || recoveryToken == "" {
-		return storedSession{}, fmt.Errorf(
-			"manager session recovery unavailable: manager_id_present=%t recovery_token_source=%s",
-			managerID != "",
-			tokenSource,
-		)
+func acquireSessionRefreshLock() (func(), error) {
+	path, err := sessionRefreshLockPath()
+	if err != nil {
+		return nil, err
 	}
-	m.logWarn("manager_session_recovery_attempt manager_id=%s recovery_token_source=%s", managerID, tokenSource)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+	}, nil
+}
 
-	var recovered struct {
+func (m *manager) updateManagerAuthState(authRequired bool, sessionID, codeVerifier string) error {
+	return m.updateManagerAuthStateWithHeartbeat(authRequired, sessionID, codeVerifier, true)
+}
+
+func (m *manager) updateManagerAuthStateWithHeartbeat(authRequired bool, sessionID, codeVerifier string, sendHeartbeat bool) error {
+	m.mu.Lock()
+	m.state.AuthRequired = authRequired
+	m.state.ReauthSessionID = strings.TrimSpace(sessionID)
+	m.state.ReauthCodeVerifier = strings.TrimSpace(codeVerifier)
+	stateCopy := m.state
+	statePath := m.cfg.StateFile
+	m.mu.Unlock()
+	if strings.TrimSpace(statePath) != "" {
+		if err := writeState(statePath, stateCopy); err != nil {
+			return err
+		}
+	}
+	m.broadcastManagerAuthState()
+	if sendHeartbeat {
+		m.sendManagerAuthStateHeartbeat()
+	}
+	return nil
+}
+
+func (m *manager) reloadAuthStateFromDisk() error {
+	statePath := strings.TrimSpace(m.cfg.StateFile)
+	if statePath == "" {
+		return nil
+	}
+	persisted, err := readState(statePath)
+	if err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	m.state.AuthRequired = persisted.AuthRequired
+	m.state.ReauthSessionID = strings.TrimSpace(persisted.ReauthSessionID)
+	m.state.ReauthCodeVerifier = strings.TrimSpace(persisted.ReauthCodeVerifier)
+	m.mu.Unlock()
+	m.broadcastManagerAuthState()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := m.refreshManagerUserIdentity(ctx); err != nil {
+		return err
+	}
+	if err := m.syncRegisteredManagerSession(ctx); err != nil {
+		m.logWarn("manager_session_sync_after_auth_reload_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), err)
+	}
+	m.sendManagerAuthStateHeartbeat()
+	return nil
+}
+
+func (m *manager) sendManagerAuthStateHeartbeat() {
+	m.mu.Lock()
+	managerID := strings.TrimSpace(m.state.ManagerID)
+	m.mu.Unlock()
+	if managerID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := m.sendHeartbeat(ctx); err != nil {
+		m.logWarn("manager_auth_state_heartbeat_error manager_id=%s err=%v", managerID, err)
+	}
+}
+
+func (m *manager) notifyRunningManagerAuthReload() error {
+	statePath := strings.TrimSpace(m.cfg.StateFile)
+	if statePath == "" {
+		return nil
+	}
+	pid, err := readManagerPIDFromState(statePath)
+	if err != nil || pid <= 0 || pid == os.Getpid() {
+		return nil
+	}
+	if err := signalManagedPIDFunc(pid, syscall.SIGHUP); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	return nil
+}
+
+func (m *manager) currentManagerAuthStatePayload() map[string]any {
+	m.mu.Lock()
+	authRequired := m.state.AuthRequired
+	sessionID := strings.TrimSpace(m.state.ReauthSessionID)
+	webBaseURL := strings.TrimRight(strings.TrimSpace(m.cfg.WebBaseURL), "/")
+	m.mu.Unlock()
+
+	payload := map[string]any{
+		"type":            "manager_auth_state",
+		"reauth_required": authRequired,
+	}
+	if sessionID != "" {
+		payload["reauth_session_id"] = sessionID
+		if webBaseURL != "" {
+			payload["reauth_url"] = webBaseURL + "/login-cli?id=" + url.QueryEscape(sessionID)
+		}
+	}
+	return payload
+}
+
+func (m *manager) broadcastManagerAuthState() {
+	payload := m.currentManagerAuthStatePayload()
+	m.browserMu.Lock()
+	clients := make([]*browserClient, 0, len(m.browserClients))
+	for client := range m.browserClients {
+		clients = append(clients, client)
+	}
+	m.browserMu.Unlock()
+	for _, client := range clients {
+		m.enqueueBrowserEvent(client, payload)
+	}
+}
+
+func (m *manager) beginManagerReauth(ctx context.Context) error {
+	return m.beginManagerReauthWithHeartbeat(ctx, true)
+}
+
+func (m *manager) beginManagerReauthWithHeartbeat(ctx context.Context, sendHeartbeat bool) error {
+	m.mu.Lock()
+	managerID := strings.TrimSpace(m.state.ManagerID)
+	authRequired := m.state.AuthRequired
+	sessionID := strings.TrimSpace(m.state.ReauthSessionID)
+	codeVerifier := strings.TrimSpace(m.state.ReauthCodeVerifier)
+	m.mu.Unlock()
+	if !authRequired {
+		if err := m.updateManagerAuthStateWithHeartbeat(true, sessionID, codeVerifier, sendHeartbeat); err != nil {
+			return err
+		}
+	}
+	if sessionID != "" && codeVerifier != "" {
+		m.broadcastManagerAuthState()
+		if sendHeartbeat {
+			m.sendManagerAuthStateHeartbeat()
+		}
+		return nil
+	}
+
+	m.logInfo(
+		"manager_reauth_init_attempt manager_id=%s previous_session_id=%s has_code_verifier=%t",
+		managerID,
+		sessionID,
+		codeVerifier != "",
+	)
+
+	stateToken, err := generateLoginState()
+	if err != nil {
+		return err
+	}
+	verifier, challenge, err := generatePKCEPair()
+	if err != nil {
+		return err
+	}
+
+	var initResp struct {
+		ShortID string `json:"shortId"`
+	}
+	if err := m.requestJSON(
+		ctx,
+		http.MethodPost,
+		"/auth/init",
+		map[string]any{
+			"challenge": challenge,
+			"state":     stateToken,
+			"port":      54321,
+		},
+		&initResp,
+		"",
+	); err != nil {
+		m.logWarn("manager_reauth_init_request_failed manager_id=%s err=%v", managerID, err)
+		return err
+	}
+	if strings.TrimSpace(initResp.ShortID) == "" {
+		m.logWarn("manager_reauth_init_missing_short_id manager_id=%s", managerID)
+		return fmt.Errorf("auth init failed: missing short id")
+	}
+	m.logInfo(
+		"manager_reauth_init_succeeded manager_id=%s short_id=%s",
+		managerID,
+		strings.TrimSpace(initResp.ShortID),
+	)
+	return m.updateManagerAuthStateWithHeartbeat(true, initResp.ShortID, verifier, sendHeartbeat)
+}
+
+func (m *manager) pollPendingReauthSession(ctx context.Context) error {
+	m.mu.Lock()
+	authRequired := m.state.AuthRequired
+	sessionID := strings.TrimSpace(m.state.ReauthSessionID)
+	codeVerifier := strings.TrimSpace(m.state.ReauthCodeVerifier)
+	m.mu.Unlock()
+	if !authRequired {
+		return nil
+	}
+	if sessionID == "" || codeVerifier == "" {
+		return m.beginManagerReauth(ctx)
+	}
+
+	var pollResp struct {
+		Pending      bool   `json:"pending"`
 		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
 		ExpiresAt    int64  `json:"expiresAt"`
 		UserID       string `json:"userId"`
 	}
-	headers := map[string]string{"X-Manager-Id": managerID}
-	path := fmt.Sprintf("/local-agent-managers/%s/session/recover", managerID)
-	if err := m.requestJSONWithHeaders(ctx, http.MethodPost, path, nil, &recovered, recoveryToken, headers); err != nil {
-		return storedSession{}, err
+	err := m.requestJSON(
+		ctx,
+		http.MethodGet,
+		"/auth/sessions/"+sessionID+"/poll?codeVerifier="+url.QueryEscape(codeVerifier),
+		nil,
+		&pollResp,
+		"",
+	)
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "404") ||
+			strings.Contains(msg, "not found") ||
+			strings.Contains(msg, "stored session token payload is invalid") ||
+			strings.Contains(msg, "stored session token payload is incomplete") {
+			m.logWarn(
+				"manager_reauth_session_invalid_rotating manager_id=%s session_id=%s err=%v",
+				strings.TrimSpace(m.state.ManagerID),
+				sessionID,
+				err,
+			)
+			if clearErr := m.updateManagerAuthState(true, "", ""); clearErr != nil {
+				return clearErr
+			}
+			return m.beginManagerReauth(ctx)
+		}
+		return err
+	}
+	if pollResp.Pending {
+		return nil
+	}
+	accessToken := strings.TrimSpace(pollResp.AccessToken)
+	refreshToken := strings.TrimSpace(pollResp.RefreshToken)
+	userID := strings.TrimSpace(pollResp.UserID)
+	if accessToken == "" || refreshToken == "" || pollResp.ExpiresAt <= 0 || userID == "" {
+		return fmt.Errorf("reauth session completed with invalid tokens")
+	}
+	managerUserID, err := m.currentManagerUserID(ctx)
+	if err != nil {
+		return err
+	}
+	if userID != managerUserID {
+		m.logWarn(
+			"manager_reauth_account_mismatch manager_id=%s manager_user_id=%s browser_user_id=%s",
+			strings.TrimSpace(m.state.ManagerID),
+			managerUserID,
+			userID,
+		)
+		return fmt.Errorf("reauth session does not match the manager account")
+	}
+	userEmail := ""
+	if claims, err := m.validateSupabaseJWT(accessToken); err == nil {
+		userEmail = claimString(claims, "email")
 	}
 	session := storedSession{
-		AccessToken:  strings.TrimSpace(recovered.AccessToken),
-		RefreshToken: strings.TrimSpace(recovered.RefreshToken),
-		ExpiresAt:    recovered.ExpiresAt,
-		UserID:       strings.TrimSpace(recovered.UserID),
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ExpiresAt:    pollResp.ExpiresAt,
+		UserID:       userID,
+		UserEmail:    userEmail,
 	}
-	if session.AccessToken == "" || session.RefreshToken == "" || session.ExpiresAt <= 0 {
-		return storedSession{}, fmt.Errorf("manager session recovery returned an invalid session")
+	if err := m.saveSession(session); err != nil {
+		return err
 	}
-	return session, nil
+	m.mu.Lock()
+	m.userID = userID
+	m.mu.Unlock()
+	if err := m.updateManagerAuthState(false, "", ""); err != nil {
+		return err
+	}
+	if err := m.syncRegisteredManagerSession(ctx); err != nil {
+		m.logWarn("manager_session_sync_after_reauth_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), err)
+	}
+	return nil
 }
 
-func (m *manager) persistManagerRecoveryToken(token string) {
-	token = strings.TrimSpace(token)
-	if token == "" {
-		return
+func (m *manager) reauthSessionLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		if err := m.pollPendingReauthSession(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			m.logWarn("manager_reauth_poll_error manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
-	err := keyringSet(keyringService, keyringRecoveryTokenUser, token)
-	if err == nil {
-		m.state.ManagerRecoveryToken = token
-		return
-	}
-	m.logWarn("manager_recovery_token_keyring_warning err=%v", err)
-	m.state.ManagerRecoveryToken = token
 }
 
 type supabaseJWKS struct {
@@ -6881,19 +7761,6 @@ func shouldReuseReloadedSession(forceRefresh bool, initial, reloaded storedSessi
 		initial.ExpiresAt != reloaded.ExpiresAt
 }
 
-func chooseNewerStoredSession(a, b storedSession) storedSession {
-	if strings.TrimSpace(a.AccessToken) == "" || strings.TrimSpace(a.RefreshToken) == "" {
-		return b
-	}
-	if strings.TrimSpace(b.AccessToken) == "" || strings.TrimSpace(b.RefreshToken) == "" {
-		return a
-	}
-	if b.ExpiresAt > a.ExpiresAt {
-		return b
-	}
-	return a
-}
-
 func isRefreshTokenRotationError(err error) bool {
 	if err == nil {
 		return false
@@ -6905,6 +7772,13 @@ func isRefreshTokenRotationError(err error) bool {
 		strings.Contains(msg, "refresh token is not valid") ||
 		strings.Contains(msg, "refresh token not found") ||
 		strings.Contains(msg, "refresh token invalid or already used")
+}
+
+func isInvalidAccessTokenError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "invalid access token")
 }
 
 func wrapRefreshTokenError(err error) error {
@@ -7742,41 +8616,6 @@ func readState(path string) (persistedState, error) {
 	return state, nil
 }
 
-func ensurePersistedManagerRecoveryToken(statePath string) error {
-	state, err := readState(statePath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	if strings.TrimSpace(state.ManagerID) == "" {
-		return nil
-	}
-	if strings.TrimSpace(loadManagerRecoveryToken(state)) != "" {
-		return nil
-	}
-	return missingRecoveryTokenInstructionError()
-}
-
-func loadManagerRecoveryToken(state persistedState) string {
-	token, _ := loadManagerRecoveryTokenWithSource(state)
-	return token
-}
-
-func loadManagerRecoveryTokenWithSource(state persistedState) (string, string) {
-	if token, err := keyringGet(keyringService, keyringRecoveryTokenUser); err == nil {
-		token = strings.TrimSpace(token)
-		if token != "" {
-			return token, "keyring"
-		}
-	}
-	if token := strings.TrimSpace(state.ManagerRecoveryToken); token != "" {
-		return token, "state_file"
-	}
-	return "", "missing"
-}
-
 func writeState(path string, state persistedState) error {
 	if state.Instances == nil {
 		state.Instances = map[string]persistedWorker{}
@@ -7789,6 +8628,99 @@ func writeState(path string, state persistedState) error {
 		return err
 	}
 	return writeFileAtomic(path, raw, 0o600, 0o700)
+}
+
+func (m *manager) taskMetadataFilePath() string {
+	if path := strings.TrimSpace(m.cfg.TasksMetadataFile); path != "" {
+		return path
+	}
+	if stateFile := strings.TrimSpace(m.cfg.StateFile); stateFile != "" {
+		return filepath.Join(filepath.Dir(stateFile), "tasks.json")
+	}
+	return ""
+}
+
+func (m *manager) readTaskMetadataStore() (taskMetadataStore, error) {
+	path := m.taskMetadataFilePath()
+	if path == "" {
+		return taskMetadataStore{Tasks: map[string]taskMetadata{}}, nil
+	}
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return taskMetadataStore{Tasks: map[string]taskMetadata{}}, nil
+	}
+	if err != nil {
+		return taskMetadataStore{}, err
+	}
+	var store taskMetadataStore
+	if err := json.Unmarshal(raw, &store); err != nil {
+		return taskMetadataStore{}, err
+	}
+	if store.Tasks == nil {
+		store.Tasks = map[string]taskMetadata{}
+	}
+	return store, nil
+}
+
+func (m *manager) writeTaskMetadataStore(store taskMetadataStore) error {
+	path := m.taskMetadataFilePath()
+	if path == "" {
+		return nil
+	}
+	if store.Tasks == nil {
+		store.Tasks = map[string]taskMetadata{}
+	}
+	raw, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, raw, 0o600, 0o700)
+}
+
+func (m *manager) taskMetadataStatus(taskID string) string {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return ""
+	}
+	m.taskMetadataMu.Lock()
+	defer m.taskMetadataMu.Unlock()
+	store, err := m.readTaskMetadataStore()
+	if err != nil {
+		m.logWarn("task_metadata_read_failed task_id=%s err=%v", taskID, err)
+		return ""
+	}
+	return strings.TrimSpace(store.Tasks[taskID].Status)
+}
+
+func (m *manager) updateTaskMetadataStatus(taskID, status string, patch taskMetadata) error {
+	taskID = strings.TrimSpace(taskID)
+	status = strings.TrimSpace(status)
+	if taskID == "" || status == "" {
+		return nil
+	}
+	m.taskMetadataMu.Lock()
+	defer m.taskMetadataMu.Unlock()
+	store, err := m.readTaskMetadataStore()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	metadata := store.Tasks[taskID]
+	metadata.ID = taskID
+	metadata.Status = status
+	metadata.LastObservedAt = now
+	metadata.LastUpdatedAt = now
+	if strings.TrimSpace(patch.AgentID) != "" {
+		metadata.AgentID = strings.TrimSpace(patch.AgentID)
+	}
+	if strings.TrimSpace(patch.InstanceID) != "" {
+		metadata.InstanceID = strings.TrimSpace(patch.InstanceID)
+	}
+	if strings.TrimSpace(patch.WorkingDir) != "" {
+		metadata.WorkingDir = strings.TrimSpace(patch.WorkingDir)
+	}
+	store.Tasks[taskID] = metadata
+	return m.writeTaskMetadataStore(store)
 }
 
 func tailManagerLogs(path string, follow bool) error {
@@ -7829,62 +8761,6 @@ func tailManagerLogs(path string, follow bool) error {
 			return nil
 		}
 		time.Sleep(1 * time.Second)
-	}
-}
-
-func tailLogs(cfg config, instanceID string, follow bool) error {
-	if cfg.DatabaseURL == "" {
-		return fmt.Errorf("PASSIVEAGENTS_DATABASE_URL is required")
-	}
-	logger := slog.New(
-		slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}),
-	)
-	db, err := sql.Open("postgres", cfg.DatabaseURL)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	last := time.Unix(0, 0)
-	for {
-		rows, err := db.Query(`
-			select log_line, log_type, "timestamp"
-			from agent_logs
-			where agent_instance_id = $1 and "timestamp" > $2
-			order by "timestamp" asc
-		`, instanceID, last)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var line string
-			var logType string
-			var ts time.Time
-			if scanErr := rows.Scan(&line, &logType, &ts); scanErr != nil {
-				_ = rows.Close()
-				return scanErr
-			}
-			level := slog.LevelInfo
-			if strings.EqualFold(logType, "error") {
-				level = slog.LevelError
-			}
-			logger.Log(
-				context.Background(),
-				level,
-				"agent_log",
-				slog.String("log_type", logType),
-				slog.String("line", line),
-				slog.Time("timestamp", ts.UTC()),
-				slog.String("agent_instance_id", instanceID),
-			)
-			last = ts
-		}
-		_ = rows.Close()
-
-		if !follow {
-			return nil
-		}
-		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -8488,7 +9364,6 @@ func cleanPromptContextText(raw string) string {
 			strings.Contains(lower, "start work now") ||
 			strings.Contains(lower, "keep responses concise") ||
 			strings.Contains(lower, "recent task checkpoints") ||
-			strings.Contains(lower, "recent task comments") ||
 			strings.Contains(lower, "lifecycle signals") ||
 			strings.Contains(lower, "pasted content") ||
 			strings.Contains(lower, "gpt-5.4") ||
@@ -8726,7 +9601,7 @@ func calculateAutomaticMaxConcurrentForSystem(cores int, totalMB, systemReserveM
 		systemReserveMB = 0
 	}
 
-	cpuCap := int(math.Floor(float64(cores) * 0.5))
+	cpuCap := int(math.Floor(float64(cores) * agentCPUConcurrencyCapFraction))
 	if cpuCap < 1 {
 		cpuCap = 1
 	}
@@ -8994,6 +9869,15 @@ func keyringUnavailable(err error) bool {
 		(strings.Contains(msg, "connect: no such file or directory") && strings.Contains(msg, "/bus"))
 }
 
+func keyringSessionMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "secret not found in keyring") ||
+		strings.Contains(msg, "not found in keyring")
+}
+
 func decodeStoredSession(raw []byte) (storedSession, error) {
 	var session storedSession
 	if err := json.Unmarshal(raw, &session); err != nil {
@@ -9013,20 +9897,210 @@ func sessionFilePath() (string, error) {
 	return filepath.Join(home, ".passiveagents", authFileName), nil
 }
 
-func writeFallbackSession(raw []byte) error {
+func sessionRefreshLockPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".passiveagents", "auth-refresh.lock"), nil
+}
+
+func legacySessionKeyFilePath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".passiveagents", authKeyFileName), nil
+}
+
+func writeStoredSession(raw []byte) error {
 	path, err := sessionFilePath()
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(path, raw, 0o600, 0o700)
+	encrypted, err := encryptStoredSession(raw)
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(path, encrypted, 0o600, 0o700); err != nil {
+		return err
+	}
+	return deleteLegacyStoredSessionKey()
 }
 
-func readFallbackSession() ([]byte, error) {
+func readStoredSession() ([]byte, error) {
 	path, err := sessionFilePath()
 	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(path)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return decryptStoredSession(raw)
+}
+
+func writeFallbackSession(raw []byte) error {
+	return writeStoredSession(raw)
+}
+
+func readFallbackSession() ([]byte, error) {
+	return readStoredSession()
+}
+
+func encryptStoredSession(raw []byte) ([]byte, error) {
+	key, err := deriveStoredSessionKey()
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := cryptorand.Read(nonce); err != nil {
+		return nil, err
+	}
+	sealed := gcm.Seal(nil, nonce, raw, nil)
+	return json.Marshal(encryptedStoredSession{
+		Version:    "aes-gcm-v1",
+		Nonce:      base64.RawStdEncoding.EncodeToString(nonce),
+		Ciphertext: base64.RawStdEncoding.EncodeToString(sealed),
+	})
+}
+
+func decryptStoredSession(raw []byte) ([]byte, error) {
+	var payload encryptedStoredSession
+	if err := json.Unmarshal(raw, &payload); err != nil || strings.TrimSpace(payload.Version) == "" {
+		return raw, nil
+	}
+	if payload.Version != "aes-gcm-v1" {
+		return nil, fmt.Errorf("unsupported stored session format %q", payload.Version)
+	}
+	key, err := deriveStoredSessionKey()
+	if err != nil {
+		return nil, err
+	}
+	nonce, err := base64.RawStdEncoding.DecodeString(strings.TrimSpace(payload.Nonce))
+	if err != nil {
+		return nil, err
+	}
+	ciphertext, err := base64.RawStdEncoding.DecodeString(strings.TrimSpace(payload.Ciphertext))
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, openErr := gcm.Open(nil, nonce, ciphertext, nil)
+	if openErr == nil {
+		return plaintext, nil
+	}
+
+	legacyKey, legacyErr := loadLegacyStoredSessionKey()
+	if legacyErr != nil {
+		return nil, openErr
+	}
+	legacyBlock, err := aes.NewCipher(legacyKey)
+	if err != nil {
+		return nil, err
+	}
+	legacyGCM, err := cipher.NewGCM(legacyBlock)
+	if err != nil {
+		return nil, err
+	}
+	return legacyGCM.Open(nil, nonce, ciphertext, nil)
+}
+
+func deriveStoredSessionKey() ([]byte, error) {
+	material, err := storedSessionKeyMaterial()
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(append([]byte(storedSessionKeySalt+":"), material...))
+	return sum[:], nil
+}
+
+func defaultStoredSessionKeyMaterial() ([]byte, error) {
+	switch managerRuntimeGOOS() {
+	case "linux":
+		for _, path := range []string{"/etc/machine-id", "/var/lib/dbus/machine-id"} {
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			if trimmed := strings.TrimSpace(string(raw)); trimmed != "" {
+				return []byte(trimmed), nil
+			}
+		}
+		return nil, fmt.Errorf("machine id unavailable")
+	case "darwin":
+		output, err := exec.Command("ioreg", "-rd1", "-c", "IOPlatformExpertDevice").Output()
+		if err != nil {
+			return nil, err
+		}
+		matches := regexp.MustCompile(`"IOPlatformUUID"\s*=\s*"([^"]+)"`).FindSubmatch(output)
+		if len(matches) != 2 {
+			return nil, fmt.Errorf("IOPlatformUUID unavailable")
+		}
+		return bytes.TrimSpace(matches[1]), nil
+	default:
+		return nil, fmt.Errorf("stored session encryption unsupported on %s", managerRuntimeGOOS())
+	}
+}
+
+func loadLegacyStoredSessionKey() ([]byte, error) {
+	keyPath, err := legacySessionKeyFilePath()
+	if err != nil {
+		return nil, err
+	}
+	keyRaw, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	return decodeStoredSessionKey(keyRaw)
+}
+
+func decodeStoredSessionKey(raw []byte) ([]byte, error) {
+	key, err := base64.RawStdEncoding.DecodeString(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return nil, err
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("invalid stored session key length %d", len(key))
+	}
+	return key, nil
+}
+
+func deleteStoredSession() error {
+	path, err := sessionFilePath()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return deleteLegacyStoredSessionKey()
+}
+
+func deleteLegacyStoredSessionKey() error {
+	keyPath, err := legacySessionKeyFilePath()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(keyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func writeFileAtomic(path string, content []byte, filePerm os.FileMode, dirPerm os.FileMode) error {
@@ -9105,12 +10179,35 @@ func newRuntimeCommand(command string) *exec.Cmd {
 	if runtime.GOOS == "windows" {
 		return exec.Command("cmd", "/C", command)
 	}
+	if niceValue, ok := agentNiceValue(); ok {
+		cmd := exec.Command("nice", "-n", strconv.Itoa(niceValue), "sh", "-lc", command)
+		if cmd.SysProcAttr == nil {
+			cmd.SysProcAttr = &syscall.SysProcAttr{}
+		}
+		cmd.SysProcAttr.Setpgid = true
+		return cmd
+	}
 	cmd := exec.Command("sh", "-lc", command)
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Setpgid = true
 	return cmd
+}
+
+func agentNiceValue() (int, bool) {
+	raw := strings.TrimSpace(os.Getenv("PASSIVEAGENTS_AGENT_NICE"))
+	if raw == "" {
+		return defaultAgentNiceValue, true
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed <= 0 {
+		return 0, false
+	}
+	if parsed > maxAgentNiceValue {
+		parsed = maxAgentNiceValue
+	}
+	return parsed, true
 }
 
 func shouldRetryPTYWithoutSetctty(err error) bool {

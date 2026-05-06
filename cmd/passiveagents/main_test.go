@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -44,8 +45,8 @@ func (n nopWriteCloser) Close() error {
 
 func TestChoosePersonaForTask_NoEligibleListReturnsFirstPersona(t *testing.T) {
 	personas := []apiAgentPersona{
-		{ID: "agent-1", Name: "A"},
-		{ID: "agent-2", Name: "B"},
+		{ID: "agent-1", Name: "A", RuntimeID: "runtime-1"},
+		{ID: "agent-2", Name: "B", RuntimeID: "runtime-2"},
 	}
 	task := apiTask{ID: "task-1"}
 
@@ -60,8 +61,8 @@ func TestChoosePersonaForTask_NoEligibleListReturnsFirstPersona(t *testing.T) {
 
 func TestChoosePersonaForTask_SelectsFirstMatchingEligiblePersona(t *testing.T) {
 	personas := []apiAgentPersona{
-		{ID: "agent-1", Name: "A"},
-		{ID: "agent-2", Name: "B"},
+		{ID: "agent-1", Name: "A", RuntimeID: "runtime-1"},
+		{ID: "agent-2", Name: "B", RuntimeID: "runtime-2"},
 	}
 	task := apiTask{
 		ID:               "task-1",
@@ -114,13 +115,13 @@ func TestBuildPersonaPromptIncludesPersonaAndTaskFields(t *testing.T) {
 		persona,
 		task,
 		nil,
-		"~/.passiveagents/agents/agent-1/lessons.md",
+		"~/.passiveagents/agents/agent-1/lessons.jsonl",
 		"~/.passiveagents/agents/agent-1/AGENT_PERSONA.md",
 		"~/.passiveagents/agents/agent-1/TASK_CONTEXT.md",
 	)
 	expectedParts := []string{
 		"# Session Start",
-		"Read AGENT_PERSONA.md, lessons.md, and TASK_CONTEXT.md before doing anything else.",
+		"Read AGENT_PERSONA.md, lessons.jsonl, and TASK_CONTEXT.md before doing anything else.",
 		"~/.passiveagents/agents/agent-1/AGENT_PERSONA.md",
 		"~/.passiveagents/agents/agent-1/TASK_CONTEXT.md",
 		"# Task Brief",
@@ -165,7 +166,7 @@ func TestWriteTaskWorkspaceFilesCreatesBootstrapFilesInWorkingDir(t *testing.T) 
 		persona,
 		task,
 		nil,
-		"# Lessons Learned\n\n- Keep fixes small.\n",
+		"{\"lesson\":\"Keep fixes small.\"}\n",
 	)
 	if err != nil {
 		t.Fatalf("writeTaskWorkspaceFiles error: %v", err)
@@ -174,7 +175,7 @@ func TestWriteTaskWorkspaceFilesCreatesBootstrapFilesInWorkingDir(t *testing.T) 
 	if got := personaPath; got != filepath.Join(workingDir, "AGENT_PERSONA.md") {
 		t.Fatalf("unexpected persona path: %s", got)
 	}
-	if got := lessonsPath; got != filepath.Join(workingDir, "lessons.md") {
+	if got := lessonsPath; got != filepath.Join(workingDir, "lessons.jsonl") {
 		t.Fatalf("unexpected lessons path: %s", got)
 	}
 	if got := taskContextPath; got != filepath.Join(workingDir, "TASK_CONTEXT.md") {
@@ -206,16 +207,20 @@ func TestBuildPersonaDocumentIncludesLessonsInstructions(t *testing.T) {
 
 	doc := buildPersonaDocument(
 		persona,
-		"/home/karthik/.passiveagents/agents/agent-1/lessons.md",
+		"/home/karthik/.passiveagents/agents/agent-1/lessons.jsonl",
 	)
 
 	expectedParts := []string{
 		"# Agent Persona: Billy",
 		"## Role\nBackend Engineer",
+		"## Operating Principles",
+		"Prefer correctness over speed",
+		"Never read or print env vars, tokens, or secrets.",
+		"Work only in the assigned working directory unless the task asks otherwise.",
 		"## Self-Improvement Loop",
 		"Read this file at the start of every session.",
-		"Lessons file: /home/karthik/.passiveagents/agents/agent-1/lessons.md",
-		"Write new lessons directly into lessons.md when you learn something durable.",
+		"Lessons file: /home/karthik/.passiveagents/agents/agent-1/lessons.jsonl",
+		"Write each new lesson as one JSON object per line",
 	}
 	for _, part := range expectedParts {
 		if !strings.Contains(doc, part) {
@@ -948,6 +953,8 @@ func TestStartWorkerProcessFailsForPTYRequiredRuntimeWhenPTYUnavailable(t *testi
 		context.Background(),
 		"instance-1",
 		"task-1",
+		"Test task",
+		"IN_PROGRESS",
 		"agent-1",
 		"session-1",
 		t.TempDir(),
@@ -1359,6 +1366,371 @@ func TestFlushPendingTaskCompletedPostsSanitizedSummaryAfterGracePeriod(t *testi
 	}
 }
 
+func TestFlushPendingTaskCompletedPersistsWorkerLessonsBeforeSync(t *testing.T) {
+	tempDir := t.TempDir()
+	personaID := "550e8400-e29b-41d4-a716-446655440000"
+	workingDir := filepath.Join(tempDir, "worktree")
+	if err := writeFileAtomic(
+		filepath.Join(workingDir, "lessons.jsonl"),
+		[]byte("{\"lesson\":\"Copy worktree lessons back before sync.\"}\n"),
+		0o600,
+		0o700,
+	); err != nil {
+		t.Fatalf("write workspace lessons: %v", err)
+	}
+
+	mgr := &manager{
+		cfg: config{
+			APIBaseURL:       "http://example.test",
+			UserJWT:          "token",
+			LessonsBaseDir:   filepath.Join(tempDir, "agents"),
+			LessonsJSONLFile: filepath.Join(tempDir, "lessons.jsonl"),
+		},
+		state: persistedState{
+			ManagerID: "manager-1",
+		},
+		logger: slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
+		client: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body := `{"ok":true}`
+				if req.Method != http.MethodPost || req.URL.Path != "/agent-instances/instance-1/update-task" {
+					body = `[]`
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(body)),
+				}, nil
+			}),
+		},
+	}
+	w := &worker{
+		instanceID:             "instance-1",
+		agentID:                personaID,
+		taskID:                 "task-1",
+		workingDir:             workingDir,
+		pendingTaskCompleted:   "Task completed.",
+		pendingTaskCompletedAt: time.Now().Add(-taskCompletedGrace - 50*time.Millisecond),
+	}
+
+	mgr.flushPendingTaskCompleted(context.Background(), w, false)
+
+	records, err := mgr.loadGlobalLessonRecords()
+	if err != nil {
+		t.Fatalf("load global lessons: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected one persisted lesson, got %d: %#v", len(records), records)
+	}
+	if records[0].AgentPersonaID != personaID || records[0].Lesson != "Copy worktree lessons back before sync." {
+		t.Fatalf("unexpected persisted lesson: %#v", records[0])
+	}
+}
+
+func TestFlushPendingTaskCompletedBacksOffAfterRateLimit(t *testing.T) {
+	requests := 0
+	mgr := &manager{
+		cfg: config{
+			APIBaseURL: "http://example.test",
+			UserJWT:    "token",
+		},
+		state: persistedState{
+			ManagerID: "manager-1",
+		},
+		client: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodPost || req.URL.Path != "/agent-instances/instance-1/update-task" {
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+				}
+				requests++
+				if requests == 1 {
+					return testJSONResponse(t, http.StatusTooManyRequests, map[string]any{
+						"error":             "rate_limited",
+						"retryAfterSeconds": 11,
+					}), nil
+				}
+				return testJSONResponse(t, http.StatusOK, map[string]any{"ok": true}), nil
+			}),
+		},
+	}
+	w := &worker{
+		instanceID:             "instance-1",
+		taskID:                 "task-1",
+		pendingTaskCompleted:   "Task completed.",
+		pendingTaskCompletedAt: time.Now().Add(-taskCompletedGrace - 50*time.Millisecond),
+	}
+
+	mgr.flushPendingTaskCompleted(context.Background(), w, false)
+	if requests != 1 {
+		t.Fatalf("expected first completed update request, got %d", requests)
+	}
+	if w.pendingTaskCompletedRetryAt.IsZero() {
+		t.Fatal("expected retry timestamp after rate limit")
+	}
+
+	mgr.flushPendingTaskCompleted(context.Background(), w, false)
+	if requests != 1 {
+		t.Fatalf("expected no retry before retry timestamp, got %d requests", requests)
+	}
+
+	w.pendingTaskCompletedRetryAt = time.Now().Add(-time.Second)
+	mgr.flushPendingTaskCompleted(context.Background(), w, false)
+	if requests != 2 {
+		t.Fatalf("expected retry after retry timestamp, got %d requests", requests)
+	}
+	if !w.sawTaskCompleted {
+		t.Fatal("expected task completion after retry succeeds")
+	}
+}
+
+func TestFlushPendingTaskCompletedSkipsWhenStatusAlreadyKnown(t *testing.T) {
+	mgr := &manager{
+		cfg: config{
+			APIBaseURL: "http://example.test",
+			UserJWT:    "token",
+		},
+		state: persistedState{
+			ManagerID: "manager-1",
+		},
+		client: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				t.Fatalf("unexpected no-op lifecycle update request: %s %s", req.Method, req.URL.String())
+				return nil, nil
+			}),
+		},
+	}
+	w := &worker{
+		instanceID:             "instance-1",
+		taskID:                 "task-1",
+		taskStatus:             "READY_FOR_REVIEW",
+		pendingTaskCompleted:   "Task completed.",
+		pendingTaskCompletedAt: time.Now().Add(-taskCompletedGrace - 50*time.Millisecond),
+	}
+
+	mgr.flushPendingTaskCompleted(context.Background(), w, false)
+	if !w.sawTaskCompleted {
+		t.Fatal("expected task completion marker to be considered handled")
+	}
+	if strings.TrimSpace(w.pendingTaskCompleted) != "" {
+		t.Fatalf("expected pending completed marker to clear, got %q", w.pendingTaskCompleted)
+	}
+}
+
+func TestFlushPendingTaskCompletedSkipsWhenMetadataStatusAlreadyKnown(t *testing.T) {
+	tasksMetadataFile := filepath.Join(t.TempDir(), "tasks.json")
+	mgr := &manager{
+		cfg: config{
+			APIBaseURL:        "http://example.test",
+			UserJWT:           "token",
+			TasksMetadataFile: tasksMetadataFile,
+		},
+		state: persistedState{
+			ManagerID: "manager-1",
+		},
+		client: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				t.Fatalf("unexpected no-op lifecycle update request: %s %s", req.Method, req.URL.String())
+				return nil, nil
+			}),
+		},
+	}
+	if err := mgr.writeTaskMetadataStore(taskMetadataStore{
+		Tasks: map[string]taskMetadata{
+			"task-1": {
+				ID:     "task-1",
+				Status: "READY_FOR_REVIEW",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("write task metadata: %v", err)
+	}
+	w := &worker{
+		instanceID:             "instance-1",
+		taskID:                 "task-1",
+		pendingTaskCompleted:   "Task completed.",
+		pendingTaskCompletedAt: time.Now().Add(-taskCompletedGrace - 50*time.Millisecond),
+	}
+
+	mgr.flushPendingTaskCompleted(context.Background(), w, false)
+	if !w.sawTaskCompleted {
+		t.Fatal("expected task completion marker to be considered handled")
+	}
+	if w.taskStatus != "READY_FOR_REVIEW" {
+		t.Fatalf("expected worker task status to be restored from metadata, got %q", w.taskStatus)
+	}
+}
+
+func TestFlushPendingTaskCompletedRefreshesBackendStatusBeforeNoopUpdate(t *testing.T) {
+	tasksMetadataFile := filepath.Join(t.TempDir(), "tasks.json")
+	getRequests := 0
+	mgr := &manager{
+		cfg: config{
+			APIBaseURL:        "http://example.test",
+			UserJWT:           "token",
+			TasksMetadataFile: tasksMetadataFile,
+		},
+		state: persistedState{
+			ManagerID: "manager-1",
+		},
+		client: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet && req.URL.Path == "/tasks/task-1" {
+					getRequests++
+					return testJSONResponse(t, http.StatusOK, map[string]any{
+						"id":                         "task-1",
+						"status":                     "READY_FOR_REVIEW",
+						"assigned_agent_instance_id": nil,
+						"working_directory":          "/tmp/passiveagents-task",
+					}), nil
+				}
+				t.Fatalf("unexpected lifecycle update request after backend status refresh: %s %s", req.Method, req.URL.String())
+				return nil, nil
+			}),
+		},
+	}
+	if err := mgr.writeTaskMetadataStore(taskMetadataStore{
+		Tasks: map[string]taskMetadata{
+			"task-1": {
+				ID:     "task-1",
+				Status: "IN_PROGRESS",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("write task metadata: %v", err)
+	}
+	w := &worker{
+		instanceID:             "instance-1",
+		taskID:                 "task-1",
+		pendingTaskCompleted:   "Task completed.",
+		pendingTaskCompletedAt: time.Now().Add(-taskCompletedGrace - 50*time.Millisecond),
+	}
+
+	mgr.flushPendingTaskCompleted(context.Background(), w, false)
+	if getRequests != 1 {
+		t.Fatalf("expected one backend task refresh request, got %d", getRequests)
+	}
+	if !w.sawTaskCompleted {
+		t.Fatal("expected task completion marker to be considered handled")
+	}
+	store, err := mgr.readTaskMetadataStore()
+	if err != nil {
+		t.Fatalf("read task metadata: %v", err)
+	}
+	if got := store.Tasks["task-1"].Status; got != "READY_FOR_REVIEW" {
+		t.Fatalf("expected refreshed metadata status READY_FOR_REVIEW, got %q", got)
+	}
+}
+
+func TestNeedsUserInputMarkerSkipsWhenStatusAlreadyKnown(t *testing.T) {
+	mgr := &manager{
+		cfg: config{
+			APIBaseURL: "http://example.test",
+			UserJWT:    "token",
+		},
+		state: persistedState{
+			ManagerID: "manager-1",
+		},
+		client: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				t.Fatalf("unexpected no-op lifecycle update request: %s %s", req.Method, req.URL.String())
+				return nil, nil
+			}),
+		},
+	}
+	w := &worker{
+		instanceID:   "instance-1",
+		taskID:       "task-1",
+		taskStatus:   "WAITING_FOR_USER_INPUT",
+		outputBuffer: &outputRingBuffer{maxSize: 4096},
+	}
+
+	chunk := "[NEEDS_USER_INPUT] Need approval to continue.\n"
+	w.outputBuffer.Write(chunk)
+	mgr.scanLifecycleMarkers(context.Background(), w, chunk)
+	if !w.sawNeedsUserInput {
+		t.Fatal("expected needs-user-input marker to be considered handled")
+	}
+}
+
+func TestNeedsUserInputMarkerSkipsWhenTaskAlreadyReadyForReview(t *testing.T) {
+	mgr := &manager{
+		cfg: config{
+			APIBaseURL: "http://example.test",
+			UserJWT:    "token",
+		},
+		state: persistedState{
+			ManagerID: "manager-1",
+		},
+		client: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				t.Fatalf("unexpected stale needs-user-input update request: %s %s", req.Method, req.URL.String())
+				return nil, nil
+			}),
+		},
+	}
+	w := &worker{
+		instanceID:   "instance-1",
+		taskID:       "task-1",
+		taskStatus:   "READY_FOR_REVIEW",
+		outputBuffer: &outputRingBuffer{maxSize: 4096},
+	}
+
+	chunk := "[NEEDS_USER_INPUT] Need approval to continue.\n"
+	w.outputBuffer.Write(chunk)
+	mgr.scanLifecycleMarkers(context.Background(), w, chunk)
+	if !w.sawNeedsUserInput {
+		t.Fatal("expected stale needs-user-input marker to be considered handled")
+	}
+}
+
+func TestUpdateTaskStatusFromLifecyclePersistsTaskMetadata(t *testing.T) {
+	var requests int
+	tasksMetadataFile := filepath.Join(t.TempDir(), "tasks.json")
+	mgr := &manager{
+		cfg: config{
+			APIBaseURL:        "http://example.test",
+			UserJWT:           "token",
+			TasksMetadataFile: tasksMetadataFile,
+		},
+		state: persistedState{
+			ManagerID: "manager-1",
+		},
+		client: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodPost || req.URL.Path != "/agent-instances/instance-1/update-task" {
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+				}
+				requests++
+				return testJSONResponse(t, http.StatusOK, map[string]any{"ok": true}), nil
+			}),
+		},
+	}
+	w := &worker{
+		instanceID: "instance-1",
+		taskID:     "task-1",
+		agentID:    "agent-1",
+		workingDir: "/tmp/passiveagents-task",
+	}
+
+	if err := mgr.updateTaskStatusFromLifecycle(context.Background(), w, "READY_FOR_REVIEW", "done"); err != nil {
+		t.Fatalf("updateTaskStatusFromLifecycle error: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("expected one lifecycle update request, got %d", requests)
+	}
+	store, err := mgr.readTaskMetadataStore()
+	if err != nil {
+		t.Fatalf("read task metadata: %v", err)
+	}
+	metadata := store.Tasks["task-1"]
+	if metadata.Status != "READY_FOR_REVIEW" {
+		t.Fatalf("expected metadata status READY_FOR_REVIEW, got %#v", metadata)
+	}
+	if metadata.InstanceID != "instance-1" || metadata.AgentID != "agent-1" {
+		t.Fatalf("expected metadata ids to persist, got %#v", metadata)
+	}
+}
+
 func TestCurrentManagerBuildMetadataDefaults(t *testing.T) {
 	originalVersion := managerVersion
 	originalChannel := managerInstallChannel
@@ -1524,6 +1896,8 @@ func TestRegisterManagerIncludesInstalledCodingAgentProviders(t *testing.T) {
 }
 
 func TestRegisterManagerIncludesStoredRefreshToken(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
 	originalKeyringSet := keyringSet
 	originalKeyringGet := keyringGet
 	var sessionInKeyring string
@@ -1593,17 +1967,6 @@ func TestRegisterManagerIncludesStoredRefreshToken(t *testing.T) {
 func TestRegisterManagerSkipsWhenManagerIDAndTunnelTokenAlreadyExist(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
-	originalKeyringGet := keyringGet
-	keyringGet = func(service, user string) (string, error) {
-		if user == keyringRecoveryTokenUser {
-			return "recovery-token", nil
-		}
-		return "", errors.New("secret not found in keyring")
-	}
-	t.Cleanup(func() {
-		keyringGet = originalKeyringGet
-	})
-
 	tempDir := t.TempDir()
 	m, err := newManager(config{
 		APIBaseURL:  "http://local.test",
@@ -1628,31 +1991,6 @@ func TestRegisterManagerSkipsWhenManagerIDAndTunnelTokenAlreadyExist(t *testing.
 
 func TestRegisterManagerSyncsStoredSessionWhenAlreadyRegistered(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-
-	originalKeyringGet := keyringGet
-	originalKeyringSet := keyringSet
-	var sessionInKeyring string
-	keyringGet = func(service, user string) (string, error) {
-		switch user {
-		case keyringRecoveryTokenUser:
-			return "recovery-token", nil
-		case keyringUser:
-			if sessionInKeyring != "" {
-				return sessionInKeyring, nil
-			}
-		}
-		return "", errors.New("secret not found in keyring")
-	}
-	keyringSet = func(service, user, value string) error {
-		if user == keyringUser {
-			sessionInKeyring = value
-		}
-		return nil
-	}
-	t.Cleanup(func() {
-		keyringGet = originalKeyringGet
-		keyringSet = originalKeyringSet
-	})
 
 	tempDir := t.TempDir()
 	m, err := newManager(config{
@@ -1738,58 +2076,6 @@ func TestRegisterManagerFetchesTunnelTokenWhenMissingLocally(t *testing.T) {
 	}
 	if got := m.tunnelID; got != "tunnel-existing" {
 		t.Fatalf("expected tunnel-existing, got %q", got)
-	}
-}
-
-func TestRegisterManagerFetchesRecoveryTokenWhenMissingLocally(t *testing.T) {
-	originalKeyringSet := keyringSet
-	originalKeyringGet := keyringGet
-	var recoveryTokenInKeyring string
-	keyringSet = func(service, user, value string) error {
-		if user == keyringRecoveryTokenUser {
-			recoveryTokenInKeyring = value
-		}
-		return nil
-	}
-	keyringGet = func(service, user string) (string, error) {
-		if user == keyringRecoveryTokenUser && recoveryTokenInKeyring != "" {
-			return recoveryTokenInKeyring, nil
-		}
-		return "", errors.New("secret not found in keyring")
-	}
-	t.Cleanup(func() {
-		keyringSet = originalKeyringSet
-		keyringGet = originalKeyringGet
-	})
-
-	tempDir := t.TempDir()
-	m, err := newManager(config{
-		APIBaseURL:  "http://local.test",
-		UserJWT:     "user-jwt",
-		MachineName: "existing-box",
-		StateFile:   filepath.Join(tempDir, "manager-state.json"),
-	})
-	if err != nil {
-		t.Fatalf("newManager error: %v", err)
-	}
-	m.state.ManagerID = "manager-existing"
-	m.state.TunnelToken = "token-existing"
-	m.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path != "/local-agent-managers/register" {
-			return nil, fmt.Errorf("unexpected request path %s", r.URL.Path)
-		}
-		if r.Method != http.MethodPost {
-			return nil, fmt.Errorf("unexpected request method %s", r.Method)
-		}
-		return jsonHTTPResponse(200, `{"machineId":"manager-existing","tunnelId":"tunnel-existing","tunnelToken":"token-existing","managerRecoveryToken":"recovery-token"}`), nil
-	})}
-
-	if err := m.registerManager(context.Background()); err != nil {
-		t.Fatalf("registerManager error: %v", err)
-	}
-
-	if recoveryTokenInKeyring != "recovery-token" {
-		t.Fatalf("expected recovery token in keyring, got %q", recoveryTokenInKeyring)
 	}
 }
 
@@ -1893,7 +2179,7 @@ func TestBootstrapRegisterAndHeartbeatPersistOnlineMetadata(t *testing.T) {
 	stateFile := filepath.Join(tempDir, "manager-state.json")
 	m, err := newManager(config{
 		APIBaseURL:  "http://local.test",
-		WebBaseURL:  "http://local.test",
+		WebBaseURL:  "https://app.passiveagents.test",
 		UserJWT:     userJWT,
 		MachineName: "install-smoke-box",
 		StateFile:   stateFile,
@@ -1997,6 +2283,56 @@ func TestBootstrapRegisterAndHeartbeatPersistOnlineMetadata(t *testing.T) {
 	}
 }
 
+func TestUpdateManagerAuthStateImmediatelyHeartbeatsFreshReauthSessionID(t *testing.T) {
+	tempDir := t.TempDir()
+	m, err := newManager(config{
+		APIBaseURL:  "http://local.test",
+		UserJWT:     "manager-jwt",
+		StateFile:   filepath.Join(tempDir, "manager-state.json"),
+		MachineName: "reauth-heartbeat-box",
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	m.state.ManagerID = "manager-123"
+
+	heartbeatSeen := make(chan map[string]any, 1)
+	var captured map[string]any
+	m.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/api/managers/manager-123/heartbeat" {
+			return nil, fmt.Errorf("unexpected request path %s", r.URL.Path)
+		}
+		if r.Method != http.MethodPatch {
+			return nil, fmt.Errorf("unexpected request method %s", r.Method)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			return nil, err
+		}
+		heartbeatSeen <- captured
+		return jsonHTTPResponse(200, `{}`), nil
+	})}
+
+	if err := m.updateManagerAuthState(true, "login-456", "verifier-456"); err != nil {
+		t.Fatalf("updateManagerAuthState error: %v", err)
+	}
+	select {
+	case captured = <-heartbeatSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for auth-state heartbeat")
+	}
+
+	resourceMetrics, ok := captured["resource_metrics"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected resource_metrics map, got %#v", captured["resource_metrics"])
+	}
+	if got := resourceMetrics["reauth_required"]; got != true {
+		t.Fatalf("expected reauth_required=true, got %#v", got)
+	}
+	if got := resourceMetrics["reauth_session_id"]; got != "login-456" {
+		t.Fatalf("expected reauth_session_id=login-456, got %#v", got)
+	}
+}
+
 func TestEnsureSupabaseBootstrapFallsBackToAPIClientConfigWhenRootReturnsHTML(t *testing.T) {
 	tempDir := t.TempDir()
 	stateFile := filepath.Join(tempDir, "manager-state.json")
@@ -2052,6 +2388,7 @@ func TestEnsureSupabaseBootstrapFallsBackToAPIClientConfigWhenRootReturnsHTML(t 
 func TestLoginKeepsSessionWhenManagerRegistrationFails(t *testing.T) {
 	originalKeyringSet := keyringSet
 	originalKeyringGet := keyringGet
+	originalSignalManagedPIDFunc := signalManagedPIDFunc
 	var storedSessionRaw string
 	keyringSet = func(service, user, password string) error {
 		storedSessionRaw = password
@@ -2066,7 +2403,19 @@ func TestLoginKeepsSessionWhenManagerRegistrationFails(t *testing.T) {
 	t.Cleanup(func() {
 		keyringSet = originalKeyringSet
 		keyringGet = originalKeyringGet
+		signalManagedPIDFunc = originalSignalManagedPIDFunc
 	})
+	signalCalls := 0
+	signalManagedPIDFunc = func(pid int, sig syscall.Signal) error {
+		signalCalls++
+		if pid != 4321 {
+			t.Fatalf("expected login to notify manager pid 4321, got %d", pid)
+		}
+		if sig != syscall.SIGHUP {
+			t.Fatalf("expected login to notify manager with SIGHUP, got %v", sig)
+		}
+		return nil
+	}
 
 	originalStdin := os.Stdin
 	reader, writer, err := os.Pipe()
@@ -2086,11 +2435,15 @@ func TestLoginKeepsSessionWhenManagerRegistrationFails(t *testing.T) {
 	stateFile := filepath.Join(tempDir, "manager-state.json")
 	m, err := newManager(config{
 		APIBaseURL: "http://local.test",
-		WebBaseURL: "http://local.test",
+		WebBaseURL: "https://app.passiveagents.test",
 		StateFile:  stateFile,
 	})
 	if err != nil {
 		t.Fatalf("newManager error: %v", err)
+	}
+	m.state.ManagerPID = 4321
+	if err := writeState(stateFile, m.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
 	}
 
 	m.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -2128,112 +2481,178 @@ func TestLoginKeepsSessionWhenManagerRegistrationFails(t *testing.T) {
 	if !strings.Contains(output, "Unable to create Cloudflare tunnel") {
 		t.Fatalf("expected registration warning in output, got %q", output)
 	}
+	if signalCalls != 1 {
+		t.Fatalf("expected login to notify the running manager once, got %d calls", signalCalls)
+	}
 }
 
-func TestRegisterManagerStoresRecoveryTokenInKeyring(t *testing.T) {
+func TestLoginSyncsNewSessionToRegisteredManager(t *testing.T) {
 	originalKeyringSet := keyringSet
 	originalKeyringGet := keyringGet
-	var recoveryTokenInKeyring string
-	keyringSet = func(service, user, value string) error {
-		if user == keyringRecoveryTokenUser {
-			recoveryTokenInKeyring = value
-		}
+	var storedSessionRaw string
+	keyringSet = func(service, user, password string) error {
+		storedSessionRaw = password
 		return nil
 	}
 	keyringGet = func(service, user string) (string, error) {
-		if user == keyringRecoveryTokenUser && recoveryTokenInKeyring != "" {
-			return recoveryTokenInKeyring, nil
+		if storedSessionRaw == "" {
+			return "", errors.New("secret not found in keyring")
 		}
-		return "", errors.New("secret not found in keyring")
+		return storedSessionRaw, nil
 	}
 	t.Cleanup(func() {
 		keyringSet = originalKeyringSet
 		keyringGet = originalKeyringGet
 	})
 
-	stateFile := filepath.Join(t.TempDir(), "manager-state.json")
+	originalStdin := os.Stdin
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe error: %v", err)
+	}
+	if _, err := writer.Write([]byte("\n")); err != nil {
+		t.Fatalf("stdin write error: %v", err)
+	}
+	_ = writer.Close()
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = originalStdin
+	})
+
+	tempDir := t.TempDir()
+	stateFile := filepath.Join(tempDir, "manager-state.json")
 	m, err := newManager(config{
 		APIBaseURL: "http://local.test",
+		WebBaseURL: "https://app.passiveagents.test",
 		StateFile:  stateFile,
-		UserJWT:    "user-jwt",
 	})
 	if err != nil {
 		t.Fatalf("newManager error: %v", err)
 	}
+	m.state.ManagerID = "manager-1"
+	m.state.TunnelToken = "tunnel-token"
+	m.state.AuthRequired = true
+	m.state.ReauthSessionID = "login-stale"
+	m.state.ReauthCodeVerifier = "verifier-stale"
+	if err := writeState(stateFile, m.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+
+	sessionSyncCalls := 0
 	m.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/local-agent-managers/register":
-			return jsonHTTPResponse(200, `{"machineId":"manager-1","managerRecoveryToken":"recovery-token"}`), nil
+		case "/version/client-config":
+			return jsonHTTPResponse(200, `{"supabaseUrl":"http://local.test","supabaseAnonKey":"anon-key"}`), nil
+		case "/auth/init":
+			return jsonHTTPResponse(200, `{"shortId":"login-123"}`), nil
+		case "/auth/sessions/login-123/poll":
+			return jsonHTTPResponse(200, `{"pending":false,"accessToken":"access-token","refreshToken":"refresh-token","expiresAt":4070908800,"userId":"user-123"}`), nil
+		case "/local-agent-managers/manager-1/session":
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode session sync payload: %v", err)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer access-token" {
+				t.Fatalf("unexpected session sync auth header: %q", got)
+			}
+			if got := payload["refreshToken"]; got != "refresh-token" {
+				t.Fatalf("unexpected synced refresh token: %#v", got)
+			}
+			sessionSyncCalls++
+			return jsonHTTPResponse(200, `{"ok":true}`), nil
+		case "/api/managers/manager-1/heartbeat":
+			return jsonHTTPResponse(200, `{"ok":true}`), nil
 		default:
 			return nil, fmt.Errorf("unexpected request path %s", r.URL.Path)
 		}
 	})}
 
-	if err := m.registerManager(context.Background()); err != nil {
-		t.Fatalf("registerManager error: %v", err)
+	if _, err := captureStdout(t, func() error {
+		return m.login(context.Background())
+	}); err != nil {
+		t.Fatalf("expected login to succeed, got %v", err)
 	}
-
-	if recoveryTokenInKeyring != "recovery-token" {
-		t.Fatalf("expected recovery token in keyring, got %q", recoveryTokenInKeyring)
-	}
-
-	state, err := readState(stateFile)
-	if err != nil {
-		t.Fatalf("readState error: %v", err)
-	}
-	if state.ManagerID != "manager-1" {
-		t.Fatalf("expected manager id to persist, got %q", state.ManagerID)
-	}
-	if state.ManagerRecoveryToken != "recovery-token" {
-		t.Fatalf("expected recovery token to persist in state file, got %q", state.ManagerRecoveryToken)
+	if sessionSyncCalls == 0 {
+		t.Fatal("expected login to sync the new session to the registered manager")
 	}
 }
 
-func TestRegisterManagerFallsBackToStateFileWhenRecoveryTokenKeyringStoreFails(t *testing.T) {
-	originalKeyringSet := keyringSet
-	originalKeyringGet := keyringGet
+func TestReloadAuthStateFromDiskRefreshesRunningManagerIdentity(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	var keyringValue string
+	origSet := keyringSet
+	origGet := keyringGet
 	keyringSet = func(service, user, value string) error {
-		if user == keyringRecoveryTokenUser {
-			return errors.New("keyring write failed")
-		}
+		keyringValue = value
 		return nil
 	}
 	keyringGet = func(service, user string) (string, error) {
-		return "", errors.New("secret not found in keyring")
+		if keyringValue == "" {
+			return "", fmt.Errorf("missing session")
+		}
+		return keyringValue, nil
 	}
 	t.Cleanup(func() {
-		keyringSet = originalKeyringSet
-		keyringGet = originalKeyringGet
+		keyringSet = origSet
+		keyringGet = origGet
 	})
 
-	stateFile := filepath.Join(t.TempDir(), "manager-state.json")
-	m, err := newManager(config{
-		APIBaseURL: "http://local.test",
-		StateFile:  stateFile,
-		UserJWT:    "user-jwt",
+	freshToken := mustTestJWT(t, jwt.MapClaims{
+		"sub": "user-fresh",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	tempDir := t.TempDir()
+	stateFile := filepath.Join(tempDir, "manager-state.json")
+	mgr, err := newManager(config{
+		StateFile:       stateFile,
+		SupabaseURL:     "http://local.test",
+		SupabaseAnonKey: "anon-key",
 	})
 	if err != nil {
 		t.Fatalf("newManager error: %v", err)
 	}
-	m.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	mgr.userID = "user-stale"
+	mgr.state.AuthRequired = true
+	mgr.state.ReauthSessionID = "login-stale"
+	mgr.state.ReauthCodeVerifier = "verifier-stale"
+	if err := writeState(stateFile, persistedState{}); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+	if err := mgr.saveSession(storedSession{
+		AccessToken:  freshToken,
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+		UserID:       "user-fresh",
+	}); err != nil {
+		t.Fatalf("saveSession error: %v", err)
+	}
+	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/local-agent-managers/register":
-			return jsonHTTPResponse(200, `{"machineId":"manager-1","managerRecoveryToken":"recovery-token"}`), nil
+		case "/auth/v1/keys":
+			return jsonHTTPResponse(500, `{"error":"jwks unavailable"}`), nil
+		case "/auth/v1/user":
+			if got := r.Header.Get("Authorization"); got != "Bearer "+freshToken {
+				return nil, fmt.Errorf("unexpected authorization header %q", got)
+			}
+			return jsonHTTPResponse(200, `{"id":"user-fresh"}`), nil
 		default:
-			return nil, fmt.Errorf("unexpected request path %s", r.URL.Path)
+			return nil, fmt.Errorf("unexpected path %s", r.URL.Path)
 		}
 	})}
 
-	if err := m.registerManager(context.Background()); err != nil {
-		t.Fatalf("registerManager error: %v", err)
+	if err := mgr.reloadAuthStateFromDisk(); err != nil {
+		t.Fatalf("reloadAuthStateFromDisk error: %v", err)
 	}
-
-	state, err := readState(stateFile)
-	if err != nil {
-		t.Fatalf("readState error: %v", err)
+	if got := mgr.userID; got != "user-fresh" {
+		t.Fatalf("expected running manager user id to refresh, got %q", got)
 	}
-	if state.ManagerRecoveryToken != "recovery-token" {
-		t.Fatalf("expected recovery token fallback in state file, got %q", state.ManagerRecoveryToken)
+	if mgr.state.AuthRequired {
+		t.Fatalf("expected auth required to be cleared from disk state")
+	}
+	if mgr.state.ReauthSessionID != "" || mgr.state.ReauthCodeVerifier != "" {
+		t.Fatalf("expected reauth fields to clear, got session=%q verifier=%q", mgr.state.ReauthSessionID, mgr.state.ReauthCodeVerifier)
 	}
 }
 
@@ -2365,84 +2784,6 @@ func TestStatusCommandReportsStalePID(t *testing.T) {
 	expected := fmt.Sprintf("Status: stopped (stale pid %d)", pid)
 	if strings.TrimSpace(output) != expected {
 		t.Fatalf("unexpected status output: %q", output)
-	}
-}
-
-func TestStatusCommandRequiresRecoveryTokenForPersistedManager(t *testing.T) {
-	useIsolatedServiceHomeDir(t)
-	stateFile := filepath.Join(t.TempDir(), "manager-state.json")
-	if err := writeState(stateFile, persistedState{
-		ManagerID: "manager-1",
-		Instances: map[string]persistedWorker{},
-	}); err != nil {
-		t.Fatalf("writeState error: %v", err)
-	}
-
-	_, err := executeCLITestCommand(t, config{StateFile: stateFile}, "status")
-	if err == nil || !strings.Contains(err.Error(), "run 'passiveagents login'") {
-		t.Fatalf("expected login instruction error, got %v", err)
-	}
-}
-
-func TestStatusCommandAcceptsKeyringBackedRecoveryToken(t *testing.T) {
-	useIsolatedServiceHomeDir(t)
-	originalKeyringGet := keyringGet
-	keyringGet = func(service, user string) (string, error) {
-		if user == keyringRecoveryTokenUser {
-			return "recovery-token", nil
-		}
-		return "", errors.New("secret not found in keyring")
-	}
-	t.Cleanup(func() {
-		keyringGet = originalKeyringGet
-	})
-
-	stateFile := filepath.Join(t.TempDir(), "manager-state.json")
-	if err := writeState(stateFile, persistedState{
-		ManagerID: "manager-1",
-		Instances: map[string]persistedWorker{},
-	}); err != nil {
-		t.Fatalf("writeState error: %v", err)
-	}
-
-	output, err := executeCLITestCommand(t, config{StateFile: stateFile}, "status")
-	if err != nil {
-		t.Fatalf("status command returned error: %v", err)
-	}
-	if strings.TrimSpace(output) != "Status: stopped" {
-		t.Fatalf("unexpected status output: %q", output)
-	}
-}
-
-func TestStartCommandRequiresRecoveryTokenForPersistedManager(t *testing.T) {
-	useIsolatedServiceHomeDir(t)
-	stateFile := filepath.Join(t.TempDir(), "manager-state.json")
-	if err := writeState(stateFile, persistedState{
-		ManagerID: "manager-1",
-		Instances: map[string]persistedWorker{},
-	}); err != nil {
-		t.Fatalf("writeState error: %v", err)
-	}
-
-	_, err := executeCLITestCommand(t, config{StateFile: stateFile}, "start")
-	if err == nil || !strings.Contains(err.Error(), "run 'passiveagents login'") {
-		t.Fatalf("expected login instruction error, got %v", err)
-	}
-}
-
-func TestStopCommandRequiresRecoveryTokenForPersistedManager(t *testing.T) {
-	useIsolatedServiceHomeDir(t)
-	stateFile := filepath.Join(t.TempDir(), "manager-state.json")
-	if err := writeState(stateFile, persistedState{
-		ManagerID: "manager-1",
-		Instances: map[string]persistedWorker{},
-	}); err != nil {
-		t.Fatalf("writeState error: %v", err)
-	}
-
-	_, err := executeCLITestCommand(t, config{StateFile: stateFile}, "stop")
-	if err == nil || !strings.Contains(err.Error(), "run 'passiveagents login'") {
-		t.Fatalf("expected login instruction error, got %v", err)
 	}
 }
 
@@ -2717,6 +3058,52 @@ func TestTailLocalAgentLogsPrintsTranscriptAndRawLogs(t *testing.T) {
 	}
 	if rawOutput != "\x1b[32mraw output\x1b[0m\n" {
 		t.Fatalf("unexpected raw output: %q", rawOutput)
+	}
+}
+
+func TestManagerLogsWarnsWhenManagerAuthRequired(t *testing.T) {
+	tempHome := t.TempDir()
+	stateFile := filepath.Join(tempHome, "manager-state.json")
+	logFile := filepath.Join(tempHome, "manager.log")
+	if err := os.WriteFile(logFile, []byte("manager log line\n"), 0o600); err != nil {
+		t.Fatalf("write manager log: %v", err)
+	}
+	if err := writeState(stateFile, persistedState{AuthRequired: true}); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+
+	root := newRootCommand(config{
+		StateFile:      stateFile,
+		ManagerLogFile: logFile,
+		APIBaseURL:     "http://local.test",
+		WebBaseURL:     "http://localhost:3000",
+	})
+	var stderr bytes.Buffer
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"manager", "logs"})
+
+	stdout, err := captureStdout(t, func() error {
+		return root.Execute()
+	})
+	if err != nil {
+		t.Fatalf("manager logs error: %v", err)
+	}
+	if !strings.Contains(stderr.String(), loginAgainCLIMessage) {
+		t.Fatalf("expected login warning on stderr, got %q", stderr.String())
+	}
+	if !strings.Contains(stdout, "manager log line") {
+		t.Fatalf("expected manager logs on stdout, got %q", stdout)
+	}
+}
+
+func TestStopCommandSkipsAuthRequiredNotice(t *testing.T) {
+	root := newRootCommand(config{StateFile: filepath.Join(t.TempDir(), "manager-state.json")})
+	cmd, _, err := root.Find([]string{"stop"})
+	if err != nil {
+		t.Fatalf("find stop command: %v", err)
+	}
+	if !shouldSkipAuthRequiredNotice(cmd) {
+		t.Fatal("expected stop command to skip auth required notice")
 	}
 }
 
@@ -3078,6 +3465,73 @@ func TestGetFreshStoredSessionReloadsAfterRefreshTokenRotation(t *testing.T) {
 	}
 }
 
+func TestGetFreshStoredSessionCreatesCrossProcessRefreshLock(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	var keyringValue string
+	origSet := keyringSet
+	origGet := keyringGet
+	keyringSet = func(service, user, value string) error {
+		keyringValue = value
+		return nil
+	}
+	keyringGet = func(service, user string) (string, error) {
+		if keyringValue == "" {
+			return "", fmt.Errorf("missing session")
+		}
+		return keyringValue, nil
+	}
+	t.Cleanup(func() {
+		keyringSet = origSet
+		keyringGet = origGet
+	})
+
+	sessionSeed := storedSession{
+		AccessToken:  "expiring-access",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(time.Minute).Unix(),
+	}
+	sessionRaw, err := json.Marshal(sessionSeed)
+	if err != nil {
+		t.Fatalf("marshal session seed: %v", err)
+	}
+	if err := keyringSet(keyringService, keyringUser, string(sessionRaw)); err != nil {
+		t.Fatalf("seed keyring session: %v", err)
+	}
+	if err := writeFallbackSession(sessionRaw); err != nil {
+		t.Fatalf("seed fallback session: %v", err)
+	}
+
+	refreshed := storedSession{
+		AccessToken:  "fresh-access",
+		RefreshToken: "fresh-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	}
+	mgr := &manager{}
+	mgr.refreshSessionHook = func(ctx context.Context, refreshToken string) (storedSession, error) {
+		if refreshToken != sessionSeed.RefreshToken {
+			t.Fatalf("expected refresh token %q, got %q", sessionSeed.RefreshToken, refreshToken)
+		}
+		return refreshed, nil
+	}
+
+	session, err := mgr.getFreshStoredSession(context.Background(), false)
+	if err != nil {
+		t.Fatalf("getFreshStoredSession error: %v", err)
+	}
+	if session.AccessToken != refreshed.AccessToken {
+		t.Fatalf("expected refreshed access token %q, got %q", refreshed.AccessToken, session.AccessToken)
+	}
+	lockPath, err := sessionRefreshLockPath()
+	if err != nil {
+		t.Fatalf("sessionRefreshLockPath error: %v", err)
+	}
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("expected refresh lock file at %s: %v", lockPath, err)
+	}
+}
+
 func TestGetFreshStoredSessionBacksOffAfterRefreshRateLimit(t *testing.T) {
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
@@ -3144,6 +3598,142 @@ func TestGetFreshStoredSessionBacksOffAfterRefreshRateLimit(t *testing.T) {
 	}
 	if mgr.sessionRefreshRetryAt.IsZero() {
 		t.Fatalf("expected refresh retry backoff to be recorded")
+	}
+}
+
+func TestGetFreshStoredSessionClearsStaleAuthRequiredWhenSessionIsUsable(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	var keyringValue string
+	origSet := keyringSet
+	origGet := keyringGet
+	keyringSet = func(service, user, value string) error {
+		keyringValue = value
+		return nil
+	}
+	keyringGet = func(service, user string) (string, error) {
+		if keyringValue == "" {
+			return "", fmt.Errorf("missing session")
+		}
+		return keyringValue, nil
+	}
+	t.Cleanup(func() {
+		keyringSet = origSet
+		keyringGet = origGet
+	})
+
+	stateFile := filepath.Join(tempHome, "manager-state.json")
+	mgr, err := newManager(config{
+		APIBaseURL: "http://local.test",
+		StateFile:  stateFile,
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	mgr.state.ManagerID = "manager-1"
+	mgr.state.AuthRequired = true
+	if err := writeState(stateFile, mgr.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+
+	sessionSeed := storedSession{
+		AccessToken:  "usable-access",
+		RefreshToken: "usable-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	}
+	sessionRaw, err := json.Marshal(sessionSeed)
+	if err != nil {
+		t.Fatalf("marshal session seed: %v", err)
+	}
+	if err := keyringSet(keyringService, keyringUser, string(sessionRaw)); err != nil {
+		t.Fatalf("seed keyring session: %v", err)
+	}
+
+	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("unexpected request while reusing usable session: %s", r.URL.Path)
+	})}
+
+	session, err := mgr.getFreshStoredSession(context.Background(), false)
+	if err != nil {
+		t.Fatalf("getFreshStoredSession error: %v", err)
+	}
+	if session.AccessToken != sessionSeed.AccessToken {
+		t.Fatalf("expected usable session, got %#v", session)
+	}
+	if mgr.state.AuthRequired || mgr.state.ReauthSessionID != "" || mgr.state.ReauthCodeVerifier != "" {
+		t.Fatalf("expected stale auth state to clear, got %#v", mgr.state)
+	}
+}
+
+func TestGetFreshStoredSessionKeepsPendingReauthWhenAccessTokenStillWorks(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	var keyringValue string
+	origSet := keyringSet
+	origGet := keyringGet
+	keyringSet = func(service, user, value string) error {
+		keyringValue = value
+		return nil
+	}
+	keyringGet = func(service, user string) (string, error) {
+		if keyringValue == "" {
+			return "", fmt.Errorf("missing session")
+		}
+		return keyringValue, nil
+	}
+	t.Cleanup(func() {
+		keyringSet = origSet
+		keyringGet = origGet
+	})
+
+	stateFile := filepath.Join(tempHome, "manager-state.json")
+	mgr, err := newManager(config{
+		APIBaseURL: "http://local.test",
+		StateFile:  stateFile,
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	mgr.state.ManagerID = "manager-1"
+	mgr.state.AuthRequired = true
+	mgr.state.ReauthSessionID = "login-123"
+	mgr.state.ReauthCodeVerifier = "verifier-123"
+	if err := writeState(stateFile, mgr.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+	if err := mgr.saveSession(storedSession{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    4102441200,
+		UserID:       "user-1",
+	}); err != nil {
+		t.Fatalf("saveSession error: %v", err)
+	}
+
+	sessionSeed := storedSession{
+		AccessToken:  "still-valid-access",
+		RefreshToken: "dead-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	}
+	sessionRaw, err := json.Marshal(sessionSeed)
+	if err != nil {
+		t.Fatalf("marshal session seed: %v", err)
+	}
+	if err := keyringSet(keyringService, keyringUser, string(sessionRaw)); err != nil {
+		t.Fatalf("seed keyring session: %v", err)
+	}
+
+	session, err := mgr.getFreshStoredSession(context.Background(), false)
+	if err != nil {
+		t.Fatalf("getFreshStoredSession error: %v", err)
+	}
+	if session.AccessToken != sessionSeed.AccessToken {
+		t.Fatalf("expected usable session, got %#v", session)
+	}
+	if !mgr.state.AuthRequired || mgr.state.ReauthSessionID != "login-123" || mgr.state.ReauthCodeVerifier != "verifier-123" {
+		t.Fatalf("expected pending reauth state to persist, got %#v", mgr.state)
 	}
 }
 
@@ -3288,424 +3878,633 @@ func TestGetFreshStoredSessionDoesNotReuseTokenOnForcedRefreshRateLimit(t *testi
 	}
 }
 
-func TestGetFreshStoredSessionRecoversManagerSessionAfterInvalidRefreshToken(t *testing.T) {
+func TestGetFreshStoredSessionMarksAuthRequiredAndPersistsPendingReauthWhenRefreshFails(t *testing.T) {
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
 
-	var keyringValue string
-	var recoveryTokenInKeyring string
-	origSet := keyringSet
-	origGet := keyringGet
-	keyringSet = func(service, user, value string) error {
-		if user == keyringRecoveryTokenUser {
-			recoveryTokenInKeyring = value
-			return nil
-		}
-		keyringValue = value
-		return nil
-	}
-	keyringGet = func(service, user string) (string, error) {
-		if user == keyringRecoveryTokenUser {
-			if recoveryTokenInKeyring == "" {
-				return "", fmt.Errorf("missing recovery token")
-			}
-			return recoveryTokenInKeyring, nil
-		}
-		if keyringValue == "" {
-			return "", fmt.Errorf("missing session")
-		}
-		return keyringValue, nil
-	}
-	t.Cleanup(func() {
-		keyringSet = origSet
-		keyringGet = origGet
+	stateFile := filepath.Join(tempHome, "manager-state.json")
+	mgr, err := newManager(config{
+		APIBaseURL:  "http://local.test",
+		WebBaseURL:  "https://app.passiveagents.com",
+		StateFile:   stateFile,
+		MachineName: "regression-box",
 	})
-
-	sessionSeed := storedSession{
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	mgr.state.ManagerID = "manager-1"
+	if err := writeState(stateFile, mgr.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+	if err := mgr.saveSession(storedSession{
 		AccessToken:  "old-access",
-		RefreshToken: "stale-refresh",
-		ExpiresAt:    time.Now().Add(2 * time.Minute).Unix(),
-	}
-	sessionRaw, err := json.Marshal(sessionSeed)
-	if err != nil {
-		t.Fatalf("marshal session seed: %v", err)
-	}
-	if err := keyringSet(keyringService, keyringUser, string(sessionRaw)); err != nil {
-		t.Fatalf("seed keyring session: %v", err)
-	}
-	if err := keyringSet(keyringService, keyringRecoveryTokenUser, "recovery-token"); err != nil {
-		t.Fatalf("seed keyring recovery token: %v", err)
-	}
-	if err := writeFallbackSession(sessionRaw); err != nil {
-		t.Fatalf("seed fallback session: %v", err)
-	}
-
-	recoveryCalls := 0
-
-	mgr := &manager{
-		cfg: config{APIBaseURL: "http://local.test"},
-		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			if r.URL.Path != "/local-agent-managers/manager-1/session/recover" {
-				t.Fatalf("unexpected path: %s", r.URL.Path)
-			}
-			if r.Method != http.MethodPost {
-				t.Fatalf("unexpected method: %s", r.Method)
-			}
-			if got := r.Header.Get("Authorization"); got != "Bearer recovery-token" {
-				t.Fatalf("unexpected authorization header: %q", got)
-			}
-			if got := r.Header.Get("X-Manager-Id"); got != "manager-1" {
-				t.Fatalf("unexpected manager header: %q", got)
-			}
-			recoveryCalls++
-			return jsonHTTPResponse(200, `{"accessToken":"new-access","refreshToken":"new-refresh","expiresAt":4102444800,"userId":"user-1"}`), nil
-		})},
-		state: persistedState{
-			ManagerID: "manager-1",
-		},
-	}
-	refreshCalls := 0
-	mgr.refreshSessionHook = func(ctx context.Context, refreshToken string) (storedSession, error) {
-		refreshCalls++
-		return storedSession{}, fmt.Errorf(
-			"refresh session failed: response status code 400: {\"code\":400,\"error_code\":\"validation_failed\",\"msg\":\"Refresh token is not valid\"}",
-		)
-	}
-
-	session, err := mgr.getFreshStoredSession(context.Background(), false)
-	if err != nil {
-		t.Fatalf("getFreshStoredSession error: %v", err)
-	}
-	if refreshCalls != 1 {
-		t.Fatalf("expected one refresh attempt, got %d", refreshCalls)
-	}
-	if recoveryCalls != 1 {
-		t.Fatalf("expected one recovery attempt, got %d", recoveryCalls)
-	}
-	if session.AccessToken != "new-access" {
-		t.Fatalf("expected recovered access token, got %q", session.AccessToken)
-	}
-	if session.RefreshToken != "new-refresh" {
-		t.Fatalf("expected recovered refresh token, got %q", session.RefreshToken)
-	}
-
-	stored, err := mgr.loadSession()
-	if err != nil {
-		t.Fatalf("loadSession error: %v", err)
-	}
-	if stored.AccessToken != "new-access" || stored.RefreshToken != "new-refresh" {
-		t.Fatalf("expected recovered session to be persisted, got %#v", stored)
-	}
-}
-
-func TestGetFreshStoredSessionRecoversManagerSessionAfterRotatedTokenRetryFails(t *testing.T) {
-	tempHome := t.TempDir()
-	t.Setenv("HOME", tempHome)
-
-	var keyringValue string
-	var recoveryTokenInKeyring string
-	origSet := keyringSet
-	origGet := keyringGet
-	keyringSet = func(service, user, value string) error {
-		if user == keyringRecoveryTokenUser {
-			recoveryTokenInKeyring = value
-			return nil
-		}
-		keyringValue = value
-		return nil
-	}
-	keyringGet = func(service, user string) (string, error) {
-		if user == keyringRecoveryTokenUser {
-			if recoveryTokenInKeyring == "" {
-				return "", fmt.Errorf("missing recovery token")
-			}
-			return recoveryTokenInKeyring, nil
-		}
-		if keyringValue == "" {
-			return "", fmt.Errorf("missing session")
-		}
-		return keyringValue, nil
-	}
-	t.Cleanup(func() {
-		keyringSet = origSet
-		keyringGet = origGet
-	})
-
-	initial := storedSession{
-		AccessToken:  "initial-access",
-		RefreshToken: "stale-refresh",
-		ExpiresAt:    time.Now().Add(2 * time.Minute).Unix(),
-	}
-	reloaded := storedSession{
-		AccessToken:  "rotated-access",
-		RefreshToken: "rotated-refresh",
-		ExpiresAt:    time.Now().Add(2 * time.Minute).Unix(),
-	}
-	initialRaw, err := json.Marshal(initial)
-	if err != nil {
-		t.Fatalf("marshal initial session: %v", err)
-	}
-	if err := keyringSet(keyringService, keyringUser, string(initialRaw)); err != nil {
-		t.Fatalf("seed keyring session: %v", err)
-	}
-	if err := keyringSet(keyringService, keyringRecoveryTokenUser, "recovery-token"); err != nil {
-		t.Fatalf("seed keyring recovery token: %v", err)
-	}
-	if err := writeFallbackSession(initialRaw); err != nil {
-		t.Fatalf("seed fallback session: %v", err)
-	}
-
-	recoveryCalls := 0
-	mgr := &manager{
-		cfg: config{APIBaseURL: "http://local.test"},
-		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			if r.URL.Path != "/local-agent-managers/manager-1/session/recover" {
-				t.Fatalf("unexpected path: %s", r.URL.Path)
-			}
-			if got := r.Header.Get("Authorization"); got != "Bearer recovery-token" {
-				t.Fatalf("unexpected authorization header: %q", got)
-			}
-			recoveryCalls++
-			return jsonHTTPResponse(200, `{"accessToken":"new-access","refreshToken":"new-refresh","expiresAt":4102444800,"userId":"user-1"}`), nil
-		})},
-		state: persistedState{ManagerID: "manager-1"},
-	}
-
-	refreshCalls := 0
-	secondRefreshErr := fmt.Errorf(
-		"refresh session failed: response status code 500: {\"code\":500,\"error_code\":\"internal_error\",\"msg\":\"temporary backend failure\"}",
-	)
-	mgr.refreshSessionHook = func(ctx context.Context, refreshToken string) (storedSession, error) {
-		refreshCalls++
-		if refreshCalls == 1 {
-			reloadedRaw, _ := json.Marshal(reloaded)
-			if err := keyringSet(keyringService, keyringUser, string(reloadedRaw)); err != nil {
-				t.Fatalf("update keyring session: %v", err)
-			}
-			if err := writeFallbackSession(reloadedRaw); err != nil {
-				t.Fatalf("update fallback session: %v", err)
-			}
-			return storedSession{}, fmt.Errorf("refresh session failed: refresh_token_already_used")
-		}
-		if refreshToken != reloaded.RefreshToken {
-			t.Fatalf("expected rotated refresh token %q, got %q", reloaded.RefreshToken, refreshToken)
-		}
-		return storedSession{}, secondRefreshErr
-	}
-
-	session, err := mgr.getFreshStoredSession(context.Background(), false)
-	if err != nil {
-		t.Fatalf("getFreshStoredSession error: %v", err)
-	}
-	if refreshCalls != 2 {
-		t.Fatalf("expected two refresh attempts, got %d", refreshCalls)
-	}
-	if recoveryCalls != 1 {
-		t.Fatalf("expected one recovery attempt, got %d", recoveryCalls)
-	}
-	if session.AccessToken != "new-access" || session.RefreshToken != "new-refresh" {
-		t.Fatalf("expected recovered session, got %#v", session)
-	}
-}
-
-func TestGetFreshStoredSessionRecoversManagerSessionFromPersistedRecoveryToken(t *testing.T) {
-	tempHome := t.TempDir()
-	t.Setenv("HOME", tempHome)
-
-	var keyringValue string
-	origSet := keyringSet
-	origGet := keyringGet
-	keyringSet = func(service, user, value string) error {
-		if user == keyringRecoveryTokenUser {
-			t.Fatalf("did not expect recovery token keyring write")
-		}
-		keyringValue = value
-		return nil
-	}
-	keyringGet = func(service, user string) (string, error) {
-		if user == keyringRecoveryTokenUser {
-			return "", fmt.Errorf("missing recovery token")
-		}
-		if keyringValue == "" {
-			return "", fmt.Errorf("missing session")
-		}
-		return keyringValue, nil
-	}
-	t.Cleanup(func() {
-		keyringSet = origSet
-		keyringGet = origGet
-	})
-
-	sessionSeed := storedSession{
-		AccessToken:  "old-access",
-		RefreshToken: "stale-refresh",
-		ExpiresAt:    time.Now().Add(2 * time.Minute).Unix(),
-	}
-	sessionRaw, err := json.Marshal(sessionSeed)
-	if err != nil {
-		t.Fatalf("marshal session seed: %v", err)
-	}
-	if err := keyringSet(keyringService, keyringUser, string(sessionRaw)); err != nil {
-		t.Fatalf("seed keyring session: %v", err)
-	}
-	if err := writeFallbackSession(sessionRaw); err != nil {
-		t.Fatalf("seed fallback session: %v", err)
-	}
-
-	recoveryCalls := 0
-	mgr := &manager{
-		cfg: config{APIBaseURL: "http://local.test"},
-		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			if r.URL.Path != "/local-agent-managers/manager-1/session/recover" {
-				t.Fatalf("unexpected path: %s", r.URL.Path)
-			}
-			if got := r.Header.Get("Authorization"); got != "Bearer persisted-recovery-token" {
-				t.Fatalf("unexpected authorization header: %q", got)
-			}
-			recoveryCalls++
-			return jsonHTTPResponse(200, `{"accessToken":"new-access","refreshToken":"new-refresh","expiresAt":4102444800,"userId":"user-1"}`), nil
-		})},
-		state: persistedState{
-			ManagerID:            "manager-1",
-			ManagerRecoveryToken: "persisted-recovery-token",
-		},
-	}
-	mgr.refreshSessionHook = func(ctx context.Context, refreshToken string) (storedSession, error) {
-		return storedSession{}, fmt.Errorf(
-			"refresh session failed: response status code 400: {\"code\":400,\"error_code\":\"validation_failed\",\"msg\":\"Refresh token is not valid\"}",
-		)
-	}
-
-	session, err := mgr.getFreshStoredSession(context.Background(), false)
-	if err != nil {
-		t.Fatalf("getFreshStoredSession error: %v", err)
-	}
-	if recoveryCalls != 1 {
-		t.Fatalf("expected one recovery attempt, got %d", recoveryCalls)
-	}
-	if session.AccessToken != "new-access" || session.RefreshToken != "new-refresh" {
-		t.Fatalf("expected recovered session, got %#v", session)
-	}
-}
-
-func TestGetFreshStoredSessionReregistersManagerWhenStoredRecoveryTokenIsInvalid(t *testing.T) {
-	tempHome := t.TempDir()
-	t.Setenv("HOME", tempHome)
-
-	var keyringValue string
-	var recoveryTokenInKeyring string
-	origSet := keyringSet
-	origGet := keyringGet
-	keyringSet = func(service, user, value string) error {
-		if user == keyringRecoveryTokenUser {
-			recoveryTokenInKeyring = value
-			return nil
-		}
-		keyringValue = value
-		return nil
-	}
-	keyringGet = func(service, user string) (string, error) {
-		if user == keyringRecoveryTokenUser {
-			if recoveryTokenInKeyring == "" {
-				return "", fmt.Errorf("missing recovery token")
-			}
-			return recoveryTokenInKeyring, nil
-		}
-		if keyringValue == "" {
-			return "", fmt.Errorf("missing session")
-		}
-		return keyringValue, nil
-	}
-	t.Cleanup(func() {
-		keyringSet = origSet
-		keyringGet = origGet
-	})
-
-	sessionSeed := storedSession{
-		AccessToken:  "still-valid-access",
 		RefreshToken: "stale-refresh",
 		ExpiresAt:    time.Now().Add(2 * time.Minute).Unix(),
 		UserID:       "user-1",
-	}
-	sessionRaw, err := json.Marshal(sessionSeed)
-	if err != nil {
-		t.Fatalf("marshal session seed: %v", err)
-	}
-	if err := keyringSet(keyringService, keyringUser, string(sessionRaw)); err != nil {
-		t.Fatalf("seed keyring session: %v", err)
-	}
-	if err := keyringSet(keyringService, keyringRecoveryTokenUser, "stale-recovery-token"); err != nil {
-		t.Fatalf("seed keyring recovery token: %v", err)
-	}
-	if err := writeFallbackSession(sessionRaw); err != nil {
-		t.Fatalf("seed fallback session: %v", err)
+	}); err != nil {
+		t.Fatalf("saveSession error: %v", err)
 	}
 
-	recoveryCalls := 0
-	registerCalls := 0
-	mgr := &manager{
-		cfg: config{
-			APIBaseURL:    "http://local.test",
-			MachineName:   "regression-box",
-			ExecutionMode: "LOCAL",
-			MaxConcurrent: 1,
-			StateFile:     filepath.Join(tempHome, "manager-state.json"),
-		},
-		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			switch r.URL.Path {
-			case "/local-agent-managers/manager-1/session/recover":
-				recoveryCalls++
-				switch got := r.Header.Get("Authorization"); got {
-				case "Bearer stale-recovery-token":
-					return jsonHTTPResponse(400, `{"message":"Stored manager session is invalid","error":"Bad Request","statusCode":400}`), nil
-				case "Bearer fresh-recovery-token":
-					return jsonHTTPResponse(200, `{"accessToken":"new-access","refreshToken":"new-refresh","expiresAt":4102444800,"userId":"user-1"}`), nil
-				default:
-					t.Fatalf("unexpected authorization header: %q", got)
-				}
-			case "/local-agent-managers/register":
-				registerCalls++
-				if got := r.Header.Get("Authorization"); got != "Bearer still-valid-access" {
-					t.Fatalf("unexpected registration authorization header: %q", got)
-				}
-				var payload map[string]any
-				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-					t.Fatalf("decode register payload: %v", err)
-				}
-				if got := payload["refreshToken"]; got != "stale-refresh" {
-					t.Fatalf("expected refreshToken stale-refresh, got %#v", got)
-				}
-				return jsonHTTPResponse(200, `{"machineId":"manager-1","tunnelToken":"token-1","managerRecoveryToken":"fresh-recovery-token"}`), nil
-			default:
-				t.Fatalf("unexpected path: %s", r.URL.Path)
-				return nil, nil
-			}
-			return nil, nil
-		})},
-		state: persistedState{
-			ManagerID:   "manager-1",
-			TunnelToken: "token-1",
-		},
-	}
+	authInitCalls := 0
+	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/auth/init" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Method != http.MethodPost {
+			t.Fatalf("unexpected method: %s", r.Method)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode auth init payload: %v", err)
+		}
+		if _, ok := payload["challenge"].(string); !ok {
+			t.Fatalf("expected challenge in auth init payload, got %#v", payload["challenge"])
+		}
+		if _, ok := payload["state"].(string); !ok {
+			t.Fatalf("expected state token in auth init payload, got %#v", payload["state"])
+		}
+		if got := payload["port"]; got != float64(54321) {
+			t.Fatalf("expected auth init port 54321, got %#v", got)
+		}
+		authInitCalls++
+		return jsonHTTPResponse(200, `{"shortId":"login-123"}`), nil
+	})}
 	mgr.refreshSessionHook = func(ctx context.Context, refreshToken string) (storedSession, error) {
+		if refreshToken != "stale-refresh" {
+			t.Fatalf("unexpected refresh token: %q", refreshToken)
+		}
 		return storedSession{}, fmt.Errorf("refresh session failed: refresh_token_already_used")
 	}
 
-	session, err := mgr.getFreshStoredSession(context.Background(), false)
+	_, err = mgr.getFreshStoredSession(context.Background(), false)
+	if err == nil {
+		t.Fatal("expected refresh failure")
+	}
+	if got := err.Error(); got != "refresh session failed: refresh token invalid or already used; run 'passiveagents login'" {
+		t.Fatalf("unexpected refresh error: %q", got)
+	}
+	if authInitCalls != 1 {
+		t.Fatalf("expected one auth init call, got %d", authInitCalls)
+	}
+	if !mgr.state.AuthRequired {
+		t.Fatal("expected auth_required to be set")
+	}
+	if mgr.state.ReauthSessionID != "login-123" {
+		t.Fatalf("expected reauth session id login-123, got %q", mgr.state.ReauthSessionID)
+	}
+	if strings.TrimSpace(mgr.state.ReauthCodeVerifier) == "" {
+		t.Fatal("expected reauth code verifier to be persisted")
+	}
+
+	state, err := readState(stateFile)
+	if err != nil {
+		t.Fatalf("readState error: %v", err)
+	}
+	if !state.AuthRequired {
+		t.Fatal("expected persisted auth_required to be true")
+	}
+	if state.ReauthSessionID != "login-123" {
+		t.Fatalf("expected persisted reauth session id login-123, got %q", state.ReauthSessionID)
+	}
+	if strings.TrimSpace(state.ReauthCodeVerifier) == "" {
+		t.Fatal("expected persisted reauth code verifier")
+	}
+}
+
+func TestBeginManagerReauthBroadcastsExistingPendingStateToBrowserClient(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	stateFile := filepath.Join(tempHome, "manager-state.json")
+	mgr, err := newManager(config{
+		APIBaseURL:  "http://local.test",
+		WebBaseURL:  "https://app.passiveagents.com",
+		StateFile:   stateFile,
+		MachineName: "regression-box",
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	mgr.state.ManagerID = "manager-1"
+	mgr.state.AuthRequired = true
+	mgr.state.ReauthSessionID = "login-123"
+	mgr.state.ReauthCodeVerifier = "verifier-123"
+	if err := writeState(stateFile, mgr.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+
+	client := &browserClient{
+		outbound: make(chan map[string]any, 1),
+	}
+	mgr.browserMu.Lock()
+	mgr.browserClients[client] = struct{}{}
+	mgr.browserMu.Unlock()
+
+	if err := mgr.beginManagerReauthWithHeartbeat(context.Background(), false); err != nil {
+		t.Fatalf("beginManagerReauthWithHeartbeat error: %v", err)
+	}
+
+	select {
+	case payload := <-client.outbound:
+		if payload["type"] != "manager_auth_state" {
+			t.Fatalf("expected manager_auth_state payload, got %#v", payload["type"])
+		}
+		if payload["reauth_required"] != true {
+			t.Fatalf("expected reauth_required payload, got %#v", payload["reauth_required"])
+		}
+		if payload["reauth_session_id"] != "login-123" {
+			t.Fatalf("expected reauth session id payload, got %#v", payload["reauth_session_id"])
+		}
+		if payload["reauth_url"] != "https://app.passiveagents.com/login-cli?id=login-123" {
+			t.Fatalf("expected reauth url payload, got %#v", payload["reauth_url"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected auth-required websocket event")
+	}
+}
+
+func TestPollPendingReauthSessionStoresRotatedTokensAndClearsAuthRequired(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	stateFile := filepath.Join(tempHome, "manager-state.json")
+	mgr, err := newManager(config{
+		APIBaseURL:  "http://local.test",
+		StateFile:   stateFile,
+		MachineName: "regression-box",
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	mgr.state.ManagerID = "manager-1"
+	mgr.state.AuthRequired = true
+	mgr.state.ReauthSessionID = "login-123"
+	mgr.state.ReauthCodeVerifier = "verifier-123"
+	if err := writeState(stateFile, mgr.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+	if err := mgr.saveSession(storedSession{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    4102441200,
+		UserID:       "user-1",
+	}); err != nil {
+		t.Fatalf("saveSession error: %v", err)
+	}
+
+	pollCalls := 0
+	syncCalls := 0
+	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/auth/sessions/login-123/poll":
+			if r.Method != http.MethodGet {
+				t.Fatalf("unexpected poll method: %s", r.Method)
+			}
+			if got := r.URL.Query().Get("codeVerifier"); got != "verifier-123" {
+				t.Fatalf("unexpected code verifier: %q", got)
+			}
+			pollCalls++
+			return jsonHTTPResponse(200, `{"pending":false,"accessToken":"new-access","refreshToken":"new-refresh","expiresAt":4102444800,"userId":"user-1"}`), nil
+		case "/local-agent-managers/manager-1/session":
+			if r.Method != http.MethodPost {
+				t.Fatalf("unexpected sync method: %s", r.Method)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer new-access" {
+				t.Fatalf("unexpected sync authorization header: %q", got)
+			}
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode sync payload: %v", err)
+			}
+			if got := payload["refreshToken"]; got != "new-refresh" {
+				t.Fatalf("unexpected synced refresh token: %#v", got)
+			}
+			syncCalls++
+			return jsonHTTPResponse(200, `{"ok":true}`), nil
+		case "/api/managers/manager-1/heartbeat":
+			if r.Method != http.MethodPatch {
+				t.Fatalf("unexpected heartbeat method: %s", r.Method)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer new-access" {
+				t.Fatalf("unexpected heartbeat authorization header: %q", got)
+			}
+			return jsonHTTPResponse(200, `{"ok":true}`), nil
+		case "/auth/v1/keys":
+			return jsonHTTPResponse(500, `{"message":"jwks unavailable in test"}`), nil
+		case "/auth/v1/user":
+			return jsonHTTPResponse(401, `{"message":"user lookup unavailable in test"}`), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	if err := mgr.pollPendingReauthSession(context.Background()); err != nil {
+		t.Fatalf("pollPendingReauthSession error: %v", err)
+	}
+	if pollCalls != 1 {
+		t.Fatalf("expected one poll call, got %d", pollCalls)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("expected one post-reauth session sync, got %d", syncCalls)
+	}
+	if mgr.state.AuthRequired {
+		t.Fatal("expected auth_required to be cleared")
+	}
+	if mgr.state.ReauthSessionID != "" {
+		t.Fatalf("expected reauth session id to be cleared, got %q", mgr.state.ReauthSessionID)
+	}
+	if mgr.state.ReauthCodeVerifier != "" {
+		t.Fatalf("expected reauth code verifier to be cleared, got %q", mgr.state.ReauthCodeVerifier)
+	}
+	if mgr.userID != "user-1" {
+		t.Fatalf("expected user id to be updated, got %q", mgr.userID)
+	}
+
+	session, err := mgr.loadSession()
+	if err != nil {
+		t.Fatalf("loadSession error: %v", err)
+	}
+	if session.AccessToken != "new-access" || session.RefreshToken != "new-refresh" {
+		t.Fatalf("expected rotated session to be stored, got %#v", session)
+	}
+
+	state, err := readState(stateFile)
+	if err != nil {
+		t.Fatalf("readState error: %v", err)
+	}
+	if state.AuthRequired {
+		t.Fatal("expected persisted auth_required to be false")
+	}
+	if state.ReauthSessionID != "" || state.ReauthCodeVerifier != "" {
+		t.Fatalf("expected persisted reauth state to be cleared, got %#v", state)
+	}
+
+	freshSession, err := mgr.getFreshStoredSession(context.Background(), false)
 	if err != nil {
 		t.Fatalf("getFreshStoredSession error: %v", err)
 	}
-	if registerCalls != 1 {
-		t.Fatalf("expected one registration retry, got %d", registerCalls)
+	if freshSession.AccessToken != "new-access" || freshSession.RefreshToken != "new-refresh" {
+		t.Fatalf("expected stored session to resume normal use, got %#v", freshSession)
 	}
-	if recoveryCalls != 2 {
-		t.Fatalf("expected two recovery attempts, got %d", recoveryCalls)
+}
+
+func TestPollPendingReauthSessionRejectsWrongAccountTokens(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	stateFile := filepath.Join(tempHome, "manager-state.json")
+	mgr, err := newManager(config{
+		APIBaseURL:  "http://local.test",
+		StateFile:   stateFile,
+		MachineName: "regression-box",
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
 	}
-	if recoveryTokenInKeyring != "fresh-recovery-token" {
-		t.Fatalf("expected refreshed recovery token in keyring, got %q", recoveryTokenInKeyring)
+	mgr.state.ManagerID = "manager-1"
+	mgr.state.AuthRequired = true
+	mgr.state.ReauthSessionID = "login-123"
+	mgr.state.ReauthCodeVerifier = "verifier-123"
+	if err := writeState(stateFile, mgr.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
 	}
-	if session.AccessToken != "new-access" || session.RefreshToken != "new-refresh" {
-		t.Fatalf("expected recovered session, got %#v", session)
+	if err := mgr.saveSession(storedSession{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    4102441200,
+		UserID:       "manager-user",
+	}); err != nil {
+		t.Fatalf("saveSession error: %v", err)
+	}
+
+	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/auth/sessions/login-123/poll":
+			return jsonHTTPResponse(200, `{"pending":false,"accessToken":"wrong-access","refreshToken":"wrong-refresh","expiresAt":4102444800,"userId":"browser-user"}`), nil
+		case "/auth/v1/keys":
+			return jsonHTTPResponse(500, `{"message":"jwks unavailable in test"}`), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	err = mgr.pollPendingReauthSession(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "does not match the manager account") {
+		t.Fatalf("expected account mismatch error, got %v", err)
+	}
+
+	session, err := mgr.loadSession()
+	if err != nil {
+		t.Fatalf("loadSession error: %v", err)
+	}
+	if session.AccessToken != "old-access" || session.RefreshToken != "old-refresh" {
+		t.Fatalf("expected original session to remain stored, got %#v", session)
+	}
+	if !mgr.state.AuthRequired {
+		t.Fatal("expected auth_required to remain set")
+	}
+}
+
+func TestPollPendingReauthSessionReinitializesAfterInvalidStoredPayload(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	stateFile := filepath.Join(tempHome, "manager-state.json")
+	mgr, err := newManager(config{
+		APIBaseURL:  "http://local.test",
+		StateFile:   stateFile,
+		MachineName: "regression-box",
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	mgr.state.ManagerID = "manager-1"
+	mgr.state.AuthRequired = true
+	mgr.state.ReauthSessionID = "login-123"
+	mgr.state.ReauthCodeVerifier = "verifier-123"
+	if err := writeState(stateFile, mgr.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+
+	authInitCalls := 0
+	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/auth/sessions/login-123/poll":
+			return jsonHTTPResponse(400, `{"message":"Stored session token payload is invalid","error":"Bad Request","statusCode":400}`), nil
+		case "/auth/init":
+			authInitCalls++
+			return jsonHTTPResponse(200, `{"shortId":"login-456"}`), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	if err := mgr.pollPendingReauthSession(context.Background()); err != nil {
+		t.Fatalf("pollPendingReauthSession error: %v", err)
+	}
+	if authInitCalls != 1 {
+		t.Fatalf("expected one auth init call, got %d", authInitCalls)
+	}
+	if !mgr.state.AuthRequired {
+		t.Fatal("expected auth_required to remain set")
+	}
+	if mgr.state.ReauthSessionID != "login-456" {
+		t.Fatalf("expected reauth session id login-456, got %q", mgr.state.ReauthSessionID)
+	}
+	if strings.TrimSpace(mgr.state.ReauthCodeVerifier) == "" {
+		t.Fatal("expected replacement reauth code verifier")
+	}
+	if mgr.state.ReauthCodeVerifier == "verifier-123" {
+		t.Fatal("expected replacement reauth code verifier to change")
+	}
+}
+
+func TestPollPendingReauthSessionReinitializesAfterMissingSession(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	stateFile := filepath.Join(tempHome, "manager-state.json")
+	mgr, err := newManager(config{
+		APIBaseURL:  "http://local.test",
+		StateFile:   stateFile,
+		MachineName: "regression-box",
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	mgr.state.ManagerID = "manager-1"
+	mgr.state.AuthRequired = true
+	mgr.state.ReauthSessionID = "login-dead"
+	mgr.state.ReauthCodeVerifier = "verifier-dead"
+	if err := writeState(stateFile, mgr.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+
+	authInitCalls := 0
+	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/auth/sessions/login-dead/poll":
+			return jsonHTTPResponse(404, `{"error":"not found"}`), nil
+		case "/auth/init":
+			authInitCalls++
+			return jsonHTTPResponse(200, `{"shortId":"login-fresh"}`), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	if err := mgr.pollPendingReauthSession(context.Background()); err != nil {
+		t.Fatalf("pollPendingReauthSession error: %v", err)
+	}
+	if authInitCalls != 1 {
+		t.Fatalf("expected one auth init call, got %d", authInitCalls)
+	}
+	if !mgr.state.AuthRequired {
+		t.Fatal("expected auth_required to remain set")
+	}
+	if mgr.state.ReauthSessionID != "login-fresh" {
+		t.Fatalf("expected reauth session id login-fresh, got %q", mgr.state.ReauthSessionID)
+	}
+	if strings.TrimSpace(mgr.state.ReauthCodeVerifier) == "" {
+		t.Fatal("expected replacement reauth code verifier")
+	}
+	if mgr.state.ReauthCodeVerifier == "verifier-dead" {
+		t.Fatal("expected replacement reauth code verifier to change")
+	}
+}
+
+func TestRefreshManagerUserIdentityRefreshesWhenStoredAccessTokenIsInvalidBeforeExpiry(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	stateFile := filepath.Join(tempHome, "manager-state.json")
+	mgr, err := newManager(config{
+		APIBaseURL:      "http://local.test",
+		WebBaseURL:      "http://localhost:3000",
+		SupabaseURL:     "http://supabase.test",
+		SupabaseAnonKey: "anon-key",
+		StateFile:       stateFile,
+		MachineName:     "regression-box",
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	mgr.state.ManagerID = "manager-1"
+	staleToken := mustTestJWT(t, jwt.MapClaims{
+		"sub":   "user-1",
+		"email": "stale@example.com",
+		"exp":   time.Now().Add(10 * time.Minute).Unix(),
+	})
+	freshToken := mustTestJWT(t, jwt.MapClaims{
+		"sub":   "user-fresh",
+		"email": "fresh@example.com",
+		"exp":   time.Now().Add(time.Hour).Unix(),
+	})
+	if err := writeState(stateFile, mgr.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+	if err := mgr.saveSession(storedSession{
+		AccessToken:  staleToken,
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(10 * time.Minute).Unix(),
+		UserID:       "user-1",
+	}); err != nil {
+		t.Fatalf("saveSession error: %v", err)
+	}
+
+	authInitCalls := 0
+	refreshCalls := 0
+	mgr.refreshSessionHook = func(ctx context.Context, refreshToken string) (storedSession, error) {
+		if refreshToken != "refresh-token" {
+			t.Fatalf("unexpected refresh token: %q", refreshToken)
+		}
+		refreshCalls++
+		return storedSession{
+			AccessToken:  freshToken,
+			RefreshToken: "rotated-refresh",
+			ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+			UserID:       "user-fresh",
+			UserEmail:    "fresh@example.com",
+		}, nil
+	}
+	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/auth/v1/keys":
+			return jsonHTTPResponse(500, `{"message":"jwks unavailable in test"}`), nil
+		case "/auth/v1/user":
+			switch r.Header.Get("Authorization") {
+			case "Bearer " + staleToken:
+				return jsonHTTPResponse(401, `{"message":"invalid token"}`), nil
+			case "Bearer " + freshToken:
+				return jsonHTTPResponse(200, `{"id":"user-fresh"}`), nil
+			default:
+				t.Fatalf("unexpected auth header: %q", r.Header.Get("Authorization"))
+				return nil, nil
+			}
+		case "/auth/init":
+			authInitCalls++
+			return jsonHTTPResponse(200, `{"shortId":"login-123"}`), nil
+		case "/local-agent-managers/manager-1/session":
+			if got := r.Header.Get("Authorization"); got != "Bearer "+freshToken {
+				t.Fatalf("unexpected session sync authorization header: %q", got)
+			}
+			return jsonHTTPResponse(200, `{"ok":true}`), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	if err := mgr.refreshManagerUserIdentity(context.Background()); err != nil {
+		t.Fatalf("refreshManagerUserIdentity error: %v", err)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("expected one forced refresh, got %d", refreshCalls)
+	}
+	if authInitCalls != 0 {
+		t.Fatalf("expected no auth init call, got %d", authInitCalls)
+	}
+	if mgr.state.AuthRequired {
+		t.Fatal("expected auth_required to stay false")
+	}
+	if mgr.userID != "user-fresh" {
+		t.Fatalf("expected refreshed user id, got %q", mgr.userID)
+	}
+	session, err := mgr.loadSession()
+	if err != nil {
+		t.Fatalf("loadSession error: %v", err)
+	}
+	if session.AccessToken != freshToken || session.RefreshToken != "rotated-refresh" {
+		t.Fatalf("expected refreshed session to be stored, got %#v", session)
+	}
+	state, err := readState(stateFile)
+	if err != nil {
+		t.Fatalf("readState error: %v", err)
+	}
+	if state.AuthRequired {
+		t.Fatal("expected persisted auth_required to stay false")
+	}
+}
+
+func TestRefreshManagerUserIdentityMarksAuthRequiredWhenStoredAccessTokenIsInvalidAndRefreshFails(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	stateFile := filepath.Join(tempHome, "manager-state.json")
+	mgr, err := newManager(config{
+		APIBaseURL:      "http://local.test",
+		WebBaseURL:      "http://localhost:3000",
+		SupabaseURL:     "http://supabase.test",
+		SupabaseAnonKey: "anon-key",
+		StateFile:       stateFile,
+		MachineName:     "regression-box",
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	mgr.state.ManagerID = "manager-1"
+	if err := writeState(stateFile, mgr.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+	if err := mgr.saveSession(storedSession{
+		AccessToken:  "wrong-backend-access",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(10 * time.Minute).Unix(),
+		UserID:       "user-1",
+	}); err != nil {
+		t.Fatalf("saveSession error: %v", err)
+	}
+
+	authInitCalls := 0
+	mgr.refreshSessionHook = func(ctx context.Context, refreshToken string) (storedSession, error) {
+		if refreshToken != "refresh-token" {
+			t.Fatalf("unexpected refresh token: %q", refreshToken)
+		}
+		return storedSession{}, fmt.Errorf("refresh session failed: refresh_token_already_used")
+	}
+	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/auth/v1/keys":
+			return jsonHTTPResponse(500, `{"message":"jwks unavailable in test"}`), nil
+		case "/auth/v1/user":
+			return jsonHTTPResponse(401, `{"message":"invalid token"}`), nil
+		case "/auth/init":
+			authInitCalls++
+			return jsonHTTPResponse(200, `{"shortId":"login-123"}`), nil
+		case "/api/managers/manager-1/heartbeat":
+			return jsonHTTPResponse(200, `{"ok":true}`), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	err = mgr.refreshManagerUserIdentity(context.Background())
+	if err == nil {
+		t.Fatal("expected refresh failure")
+	}
+	if got := wrapRefreshTokenError(err).Error(); got != "refresh session failed: refresh token invalid or already used; run 'passiveagents login'" {
+		t.Fatalf("unexpected refresh error: %q", got)
+	}
+	if authInitCalls != 1 {
+		t.Fatalf("expected one auth init call, got %d", authInitCalls)
+	}
+	if !mgr.state.AuthRequired {
+		t.Fatal("expected auth_required to be set")
+	}
+	if mgr.state.ReauthSessionID != "login-123" {
+		t.Fatalf("expected reauth session id login-123, got %q", mgr.state.ReauthSessionID)
+	}
+	state, err := readState(stateFile)
+	if err != nil {
+		t.Fatalf("readState error: %v", err)
+	}
+	if !state.AuthRequired {
+		t.Fatal("expected persisted auth_required")
 	}
 }
 
@@ -3713,53 +4512,29 @@ func TestManagerRequestJSONWrapsInvalidRefreshTokenErrorWhenRecoveryUnavailable(
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
 
-	var keyringValue string
-	origSet := keyringSet
-	origGet := keyringGet
-	keyringSet = func(service, user, value string) error {
-		keyringValue = value
-		return nil
-	}
-	keyringGet = func(service, user string) (string, error) {
-		if user == keyringRecoveryTokenUser {
-			return "", fmt.Errorf("missing recovery token")
-		}
-		if keyringValue == "" {
-			return "", fmt.Errorf("missing session")
-		}
-		return keyringValue, nil
-	}
-	t.Cleanup(func() {
-		keyringSet = origSet
-		keyringGet = origGet
+	mgr, err := newManager(config{
+		APIBaseURL: "http://local.test",
+		StateFile:  filepath.Join(tempHome, "manager-state.json"),
 	})
-
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
 	sessionSeed := storedSession{
 		AccessToken:  "old-access",
 		RefreshToken: "stale-refresh",
 		ExpiresAt:    time.Now().Add(2 * time.Minute).Unix(),
 	}
-	sessionRaw, err := json.Marshal(sessionSeed)
-	if err != nil {
-		t.Fatalf("marshal session seed: %v", err)
-	}
-	if err := keyringSet(keyringService, keyringUser, string(sessionRaw)); err != nil {
-		t.Fatalf("seed keyring session: %v", err)
-	}
-	if err := writeFallbackSession(sessionRaw); err != nil {
-		t.Fatalf("seed fallback session: %v", err)
+	if err := mgr.saveSession(sessionSeed); err != nil {
+		t.Fatalf("saveSession error: %v", err)
 	}
 
-	mgr := &manager{
-		cfg: config{APIBaseURL: "http://local.test"},
-		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/auth/init" {
 			t.Fatalf("unexpected API request: %s", r.URL.Path)
-			return nil, nil
-		})},
-		state: persistedState{
-			ManagerID: "manager-1",
-		},
-	}
+		}
+		return jsonHTTPResponse(200, `{"shortId":"login-123"}`), nil
+	})}
+	mgr.state.ManagerID = "manager-1"
 	mgr.refreshSessionHook = func(ctx context.Context, refreshToken string) (storedSession, error) {
 		return storedSession{}, fmt.Errorf(
 			"refresh session failed: response status code 400: {\"code\":400,\"error_code\":\"validation_failed\",\"msg\":\"Refresh token is not valid\"}",
@@ -3792,10 +4567,6 @@ func TestCleanCLIErrorPromptsLoginAgainForUnrecoverableAuthFailures(t *testing.T
 			name: "missing refresh token",
 			err:  fmt.Errorf("missing refresh token; run login again"),
 		},
-		{
-			name: "missing recovery configuration",
-			err:  missingRecoveryTokenInstructionError(),
-		},
 	}
 
 	for _, tc := range cases {
@@ -3809,7 +4580,7 @@ func TestCleanCLIErrorPromptsLoginAgainForUnrecoverableAuthFailures(t *testing.T
 	}
 }
 
-func TestLoadSessionPrefersNewerFallbackSession(t *testing.T) {
+func TestLoadSessionPrefersCanonicalKeyringSession(t *testing.T) {
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
 
@@ -3821,9 +4592,9 @@ func TestLoadSessionPrefersNewerFallbackSession(t *testing.T) {
 	})
 
 	keyringSession := storedSession{
-		AccessToken:  "old-access",
-		RefreshToken: "old-refresh",
-		ExpiresAt:    time.Now().Add(10 * time.Minute).Unix(),
+		AccessToken:  "keyring-access",
+		RefreshToken: "keyring-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
 	}
 	keyringRaw, err := json.Marshal(keyringSession)
 	if err != nil {
@@ -3837,16 +4608,16 @@ func TestLoadSessionPrefersNewerFallbackSession(t *testing.T) {
 	}
 
 	fallbackSession := storedSession{
-		AccessToken:  "new-access",
-		RefreshToken: "new-refresh",
+		AccessToken:  "fallback-access",
+		RefreshToken: "fallback-refresh",
 		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
 	}
 	fallbackRaw, err := json.Marshal(fallbackSession)
 	if err != nil {
 		t.Fatalf("marshal fallback session: %v", err)
 	}
-	if err := writeFallbackSession(fallbackRaw); err != nil {
-		t.Fatalf("write fallback session: %v", err)
+	if err := writeStoredSession(fallbackRaw); err != nil {
+		t.Fatalf("write stored session: %v", err)
 	}
 
 	mgr := &manager{}
@@ -3854,21 +4625,105 @@ func TestLoadSessionPrefersNewerFallbackSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadSession error: %v", err)
 	}
-	if session.AccessToken != fallbackSession.AccessToken {
-		t.Fatalf("expected fallback access token %q, got %q", fallbackSession.AccessToken, session.AccessToken)
+	if session.AccessToken != keyringSession.AccessToken {
+		t.Fatalf("expected keyring access token %q, got %q", keyringSession.AccessToken, session.AccessToken)
 	}
-	if session.RefreshToken != fallbackSession.RefreshToken {
-		t.Fatalf("expected fallback refresh token %q, got %q", fallbackSession.RefreshToken, session.RefreshToken)
+	if session.RefreshToken != keyringSession.RefreshToken {
+		t.Fatalf("expected keyring refresh token %q, got %q", keyringSession.RefreshToken, session.RefreshToken)
 	}
 }
 
-func TestSaveSessionSyncsFallbackWhenKeyringSucceeds(t *testing.T) {
+func TestLoadSessionFallsBackWhenKeyringSessionIsMissing(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	origSet := keyringSet
+	origGet := keyringGet
+	t.Cleanup(func() {
+		keyringSet = origSet
+		keyringGet = origGet
+	})
+
+	keyringGet = func(service, user string) (string, error) {
+		return "", errors.New("secret not found in keyring")
+	}
+	keyringSet = func(service, user, value string) error {
+		return nil
+	}
+
+	stored := storedSession{
+		AccessToken:  "stored-access",
+		RefreshToken: "stored-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	}
+	storedRaw, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatalf("marshal stored session: %v", err)
+	}
+	if err := writeStoredSession(storedRaw); err != nil {
+		t.Fatalf("write stored session: %v", err)
+	}
+
+	mgr := &manager{}
+	session, err := mgr.loadSession()
+	if err != nil {
+		t.Fatalf("loadSession error: %v", err)
+	}
+	if session.AccessToken != stored.AccessToken {
+		t.Fatalf("expected stored access token %q, got %q", stored.AccessToken, session.AccessToken)
+	}
+	if session.RefreshToken != stored.RefreshToken {
+		t.Fatalf("expected stored refresh token %q, got %q", stored.RefreshToken, session.RefreshToken)
+	}
+}
+
+func TestLoadSessionDoesNotMaskKeyringErrorsWithFallbackData(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	origSet := keyringSet
+	origGet := keyringGet
+	t.Cleanup(func() {
+		keyringSet = origSet
+		keyringGet = origGet
+	})
+
+	keyringGet = func(service, user string) (string, error) {
+		return "", errors.New("keyring permission denied")
+	}
+	keyringSet = func(service, user, value string) error {
+		return nil
+	}
+
+	stored := storedSession{
+		AccessToken:  "stored-access",
+		RefreshToken: "stored-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	}
+	storedRaw, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatalf("marshal stored session: %v", err)
+	}
+	if err := writeStoredSession(storedRaw); err != nil {
+		t.Fatalf("write stored session: %v", err)
+	}
+
+	_, err = (&manager{}).loadSession()
+	if err == nil {
+		t.Fatal("expected loadSession error")
+	}
+	if got := err.Error(); got != "keyring permission denied" {
+		t.Fatalf("loadSession error = %q, want %q", got, "keyring permission denied")
+	}
+}
+
+func TestSaveSessionKeepsFallbackMirrorWhenKeyringSucceeds(t *testing.T) {
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
 
 	var keyringValue string
-	originalKeyringSet := keyringSet
-	originalKeyringGet := keyringGet
+	origSet := keyringSet
+	origGet := keyringGet
 	keyringSet = func(service, user, value string) error {
 		keyringValue = value
 		return nil
@@ -3877,46 +4732,62 @@ func TestSaveSessionSyncsFallbackWhenKeyringSucceeds(t *testing.T) {
 		return keyringValue, nil
 	}
 	t.Cleanup(func() {
-		keyringSet = originalKeyringSet
-		keyringGet = originalKeyringGet
+		keyringSet = origSet
+		keyringGet = origGet
 	})
 
-	stale := storedSession{
-		AccessToken:  "stale-access",
-		RefreshToken: "stale-refresh",
-		ExpiresAt:    time.Now().Add(-time.Hour).Unix(),
+	legacyKeyPath := filepath.Join(tempHome, ".passiveagents", authKeyFileName)
+	legacyKey := make([]byte, 32)
+	if _, err := cryptorand.Read(legacyKey); err != nil {
+		t.Fatalf("cryptorand.Read: %v", err)
 	}
-	staleRaw, err := json.Marshal(stale)
-	if err != nil {
-		t.Fatalf("marshal stale session: %v", err)
-	}
-	if err := writeFallbackSession(staleRaw); err != nil {
-		t.Fatalf("seed fallback session: %v", err)
+	if err := writeFileAtomic(legacyKeyPath, []byte(base64.RawStdEncoding.EncodeToString(legacyKey)), 0o600, 0o700); err != nil {
+		t.Fatalf("writeFileAtomic legacy key: %v", err)
 	}
 
-	current := storedSession{
+	session := storedSession{
 		AccessToken:  "fresh-access",
 		RefreshToken: "fresh-refresh",
 		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
 	}
 	mgr := &manager{}
-	if err := mgr.saveSession(current); err != nil {
+	if err := mgr.saveSession(session); err != nil {
 		t.Fatalf("saveSession: %v", err)
 	}
 
-	fallbackRaw, err := readFallbackSession()
+	keyringSession, err := decodeStoredSession([]byte(keyringValue))
 	if err != nil {
-		t.Fatalf("readFallbackSession: %v", err)
+		t.Fatalf("decode keyring session: %v", err)
 	}
-	fallbackSession, err := decodeStoredSession(fallbackRaw)
+	if keyringSession.RefreshToken != session.RefreshToken {
+		t.Fatalf("expected keyring refresh token %q, got %q", session.RefreshToken, keyringSession.RefreshToken)
+	}
+
+	storedRaw, err := readStoredSession()
 	if err != nil {
-		t.Fatalf("decodeStoredSession: %v", err)
+		t.Fatalf("readStoredSession: %v", err)
 	}
-	if fallbackSession.RefreshToken != current.RefreshToken {
-		t.Fatalf("expected fallback refresh token %q, got %q", current.RefreshToken, fallbackSession.RefreshToken)
+	fallbackSession, err := decodeStoredSession(storedRaw)
+	if err != nil {
+		t.Fatalf("decodeStoredSession fallback: %v", err)
 	}
-	if fallbackSession.AccessToken != current.AccessToken {
-		t.Fatalf("expected fallback access token %q, got %q", current.AccessToken, fallbackSession.AccessToken)
+	if fallbackSession.RefreshToken != session.RefreshToken {
+		t.Fatalf("expected fallback refresh token %q, got %q", session.RefreshToken, fallbackSession.RefreshToken)
+	}
+	if _, err := os.Stat(legacyKeyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected legacy fallback key to be removed, got err=%v", err)
+	}
+
+	keyringGet = func(service, user string) (string, error) {
+		return "", fmt.Errorf("keyring is not available")
+	}
+
+	loaded, err := mgr.loadSession()
+	if err != nil {
+		t.Fatalf("loadSession fallback restore: %v", err)
+	}
+	if loaded.RefreshToken != session.RefreshToken {
+		t.Fatalf("expected restored refresh token %q, got %q", session.RefreshToken, loaded.RefreshToken)
 	}
 }
 
@@ -3924,22 +4795,22 @@ func TestSaveSessionFallsBackWhenKeyringDBusUnavailable(t *testing.T) {
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
 
-	originalKeyringSet := keyringSet
-	originalKeyringGet := keyringGet
+	origSet := keyringSet
+	origGet := keyringGet
 	keyringSet = func(service, user, value string) error {
 		return fmt.Errorf("dial unix /run/user/1000/bus: connect: no such file or directory")
 	}
 	keyringGet = func(service, user string) (string, error) {
-		return "", fmt.Errorf("unreachable")
+		return "", fmt.Errorf("secret not found in keyring")
 	}
 	t.Cleanup(func() {
-		keyringSet = originalKeyringSet
-		keyringGet = originalKeyringGet
+		keyringSet = origSet
+		keyringGet = origGet
 	})
 
 	session := storedSession{
-		AccessToken:  "fresh-access",
-		RefreshToken: "fresh-refresh",
+		AccessToken:  "stored-access",
+		RefreshToken: "stored-refresh",
 		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
 	}
 	mgr := &manager{}
@@ -3947,42 +4818,58 @@ func TestSaveSessionFallsBackWhenKeyringDBusUnavailable(t *testing.T) {
 		t.Fatalf("saveSession: %v", err)
 	}
 
-	fallbackRaw, err := readFallbackSession()
+	storedRaw, err := readStoredSession()
 	if err != nil {
-		t.Fatalf("readFallbackSession: %v", err)
+		t.Fatalf("readStoredSession: %v", err)
 	}
-	fallbackSession, err := decodeStoredSession(fallbackRaw)
+	storedSession, err := decodeStoredSession(storedRaw)
 	if err != nil {
 		t.Fatalf("decodeStoredSession: %v", err)
 	}
-	if fallbackSession.RefreshToken != session.RefreshToken {
-		t.Fatalf("expected fallback refresh token %q, got %q", session.RefreshToken, fallbackSession.RefreshToken)
+	if storedSession.RefreshToken != session.RefreshToken {
+		t.Fatalf("expected stored refresh token %q, got %q", session.RefreshToken, storedSession.RefreshToken)
+	}
+
+	path, err := sessionFilePath()
+	if err != nil {
+		t.Fatalf("sessionFilePath: %v", err)
+	}
+	encryptedRaw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read encrypted fallback file: %v", err)
+	}
+	if bytes.Contains(encryptedRaw, []byte(session.AccessToken)) {
+		t.Fatal("expected fallback file to avoid plaintext access token")
+	}
+	if bytes.Contains(encryptedRaw, []byte(session.RefreshToken)) {
+		t.Fatal("expected fallback file to avoid plaintext refresh token")
+	}
+	legacyKeyPath := filepath.Join(tempHome, ".passiveagents", authKeyFileName)
+	if _, err := os.Stat(legacyKeyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected no legacy fallback key file, got err=%v", err)
 	}
 }
 
-func TestSaveSessionFallsBackWhenMacKeychainUnavailable(t *testing.T) {
+func TestSaveSessionCreatesLockedDownStoredSessionFile(t *testing.T) {
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
 
-	originalKeyringSet := keyringSet
-	originalKeyringGet := keyringGet
-	originalGOOS := managerRuntimeGOOS
+	origSet := keyringSet
+	origGet := keyringGet
 	keyringSet = func(service, user, value string) error {
-		return fmt.Errorf("User interaction is not allowed.")
+		return fmt.Errorf("dial unix /run/user/1000/bus: connect: no such file or directory")
 	}
 	keyringGet = func(service, user string) (string, error) {
-		return "", fmt.Errorf("unreachable")
+		return "", errors.New("secret not found in keyring")
 	}
-	managerRuntimeGOOS = func() string { return "darwin" }
 	t.Cleanup(func() {
-		keyringSet = originalKeyringSet
-		keyringGet = originalKeyringGet
-		managerRuntimeGOOS = originalGOOS
+		keyringSet = origSet
+		keyringGet = origGet
 	})
 
 	session := storedSession{
-		AccessToken:  "fresh-access",
-		RefreshToken: "fresh-refresh",
+		AccessToken:  "stored-access",
+		RefreshToken: "stored-refresh",
 		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
 	}
 	mgr := &manager{}
@@ -3990,54 +4877,97 @@ func TestSaveSessionFallsBackWhenMacKeychainUnavailable(t *testing.T) {
 		t.Fatalf("saveSession: %v", err)
 	}
 
-	fallbackRaw, err := readFallbackSession()
+	path, err := sessionFilePath()
 	if err != nil {
-		t.Fatalf("readFallbackSession: %v", err)
+		t.Fatalf("sessionFilePath: %v", err)
 	}
-	fallbackSession, err := decodeStoredSession(fallbackRaw)
+	info, err := os.Stat(path)
 	if err != nil {
-		t.Fatalf("decodeStoredSession: %v", err)
+		t.Fatalf("stat stored session file: %v", err)
 	}
-	if fallbackSession.RefreshToken != session.RefreshToken {
-		t.Fatalf("expected fallback refresh token %q, got %q", session.RefreshToken, fallbackSession.RefreshToken)
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("expected stored session file permissions 0600, got %#o", got)
 	}
 }
 
-func TestLoadSessionFallsBackWhenMacKeychainUnavailable(t *testing.T) {
+func TestSaveSessionIgnoresStoredMirrorFailureAfterKeyringSuccess(t *testing.T) {
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
 
-	originalKeyringGet := keyringGet
-	originalGOOS := managerRuntimeGOOS
-	keyringGet = func(service, user string) (string, error) {
-		return "", fmt.Errorf("The keychain is locked.")
+	origSet := keyringSet
+	origGet := keyringGet
+	origKeyMaterial := storedSessionKeyMaterial
+	var keyringValue string
+	keyringSet = func(service, user, value string) error {
+		keyringValue = value
+		return nil
 	}
-	managerRuntimeGOOS = func() string { return "darwin" }
+	keyringGet = func(service, user string) (string, error) {
+		return keyringValue, nil
+	}
+	storedSessionKeyMaterial = func() ([]byte, error) {
+		return nil, fmt.Errorf("stored session encryption unsupported on windows")
+	}
 	t.Cleanup(func() {
-		keyringGet = originalKeyringGet
-		managerRuntimeGOOS = originalGOOS
+		keyringSet = origSet
+		keyringGet = origGet
+		storedSessionKeyMaterial = origKeyMaterial
 	})
 
 	session := storedSession{
-		AccessToken:  "fallback-access",
-		RefreshToken: "fallback-refresh",
+		AccessToken:  "keyring-access",
+		RefreshToken: "keyring-refresh",
 		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
 	}
-	raw, err := json.Marshal(session)
-	if err != nil {
-		t.Fatalf("marshal fallback session: %v", err)
-	}
-	if err := writeFallbackSession(raw); err != nil {
-		t.Fatalf("write fallback session: %v", err)
+	mgr := &manager{}
+	if err := mgr.saveSession(session); err != nil {
+		t.Fatalf("saveSession should succeed when keyring write succeeds, got %v", err)
 	}
 
-	mgr := &manager{}
 	loaded, err := mgr.loadSession()
 	if err != nil {
-		t.Fatalf("loadSession: %v", err)
+		t.Fatalf("loadSession from keyring: %v", err)
 	}
 	if loaded.RefreshToken != session.RefreshToken {
-		t.Fatalf("expected fallback refresh token %q, got %q", session.RefreshToken, loaded.RefreshToken)
+		t.Fatalf("expected refresh token %q, got %q", session.RefreshToken, loaded.RefreshToken)
+	}
+}
+
+func TestReadStoredSessionSupportsLegacyPlaintextFallback(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	legacySession := storedSession{
+		AccessToken:  "legacy-access",
+		RefreshToken: "legacy-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	}
+	legacyRaw, err := json.Marshal(legacySession)
+	if err != nil {
+		t.Fatalf("marshal legacy session: %v", err)
+	}
+
+	path, err := sessionFilePath()
+	if err != nil {
+		t.Fatalf("sessionFilePath: %v", err)
+	}
+	if err := writeFileAtomic(path, legacyRaw, 0o600, 0o700); err != nil {
+		t.Fatalf("write legacy fallback file: %v", err)
+	}
+
+	storedRaw, err := readStoredSession()
+	if err != nil {
+		t.Fatalf("readStoredSession: %v", err)
+	}
+	storedSession, err := decodeStoredSession(storedRaw)
+	if err != nil {
+		t.Fatalf("decodeStoredSession: %v", err)
+	}
+	if storedSession.AccessToken != legacySession.AccessToken {
+		t.Fatalf("expected legacy access token %q, got %q", legacySession.AccessToken, storedSession.AccessToken)
+	}
+	if storedSession.RefreshToken != legacySession.RefreshToken {
+		t.Fatalf("expected legacy refresh token %q, got %q", legacySession.RefreshToken, storedSession.RefreshToken)
 	}
 }
 
@@ -4631,7 +5561,7 @@ func TestWorkerPromptStatusForRuntimeDistinguishesReadyEmptyAndReadyWithDraft(t 
 
 	readyWithDraft := workerPromptStatusForRuntime("gemini --model auto", strings.Join([]string{
 		"Gemini CLI",
-		"› Read .passiveagents/AGENT_PERSONA.md, .passiveagents/lessons.md, and",
+		"› Read .passiveagents/AGENT_PERSONA.md, .passiveagents/lessons.jsonl, and",
 		".passiveagents/TASK_CONTEXT.md in the current workspace, then continue",
 		"the task and follow the lifecycle signals in .passiveagents/TASK_CONTEXT.md.",
 	}, "\n"))
@@ -4886,8 +5816,6 @@ func TestRecoverRestartableWorkersRestartsDeadPersistedWorkerInSavedWorkingDir(t
 			return jsonHTTPResponse(200, `{"id":"instance-1"}`), nil
 		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/instance-1/claim-task":
 			return jsonHTTPResponse(200, `{"claimed":true}`), nil
-		case r.Method == http.MethodGet && r.URL.Path == "/tasks/task-1/comments":
-			return jsonHTTPResponse(200, `[]`), nil
 		case r.Method == http.MethodGet && r.URL.Path == "/task-checkpoints":
 			return jsonHTTPResponse(200, `[]`), nil
 		default:
@@ -5115,8 +6043,6 @@ func TestRecoverOrphanedWorkersRestartsIdleProcessInSavedWorkingDir(t *testing.T
 			return jsonHTTPResponse(200, `{"id":"instance-1"}`), nil
 		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/instance-1/claim-task":
 			return jsonHTTPResponse(200, `{"claimed":true}`), nil
-		case r.Method == http.MethodGet && r.URL.Path == "/tasks/task-1/comments":
-			return jsonHTTPResponse(200, `[]`), nil
 		case r.Method == http.MethodGet && r.URL.Path == "/task-checkpoints":
 			return jsonHTTPResponse(200, `[]`), nil
 		default:
@@ -5259,8 +6185,6 @@ func TestRecoverOrphanedWorkersRestartsPersistedIdleProcessWhenBackendStatusIsSt
 			return jsonHTTPResponse(200, `{"id":"instance-1"}`), nil
 		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/instance-1/claim-task":
 			return jsonHTTPResponse(200, `{"claimed":true}`), nil
-		case r.Method == http.MethodGet && r.URL.Path == "/tasks/task-1/comments":
-			return jsonHTTPResponse(200, `[]`), nil
 		case r.Method == http.MethodGet && r.URL.Path == "/task-checkpoints":
 			return jsonHTTPResponse(200, `[]`), nil
 		default:
@@ -5626,10 +6550,10 @@ func TestCurrentWakeCapacityUsesRunningWorkersAndDynamicMax(t *testing.T) {
 	}
 }
 
-func TestCalculateAutomaticMaxConcurrentUsesHalfCoreCeiling(t *testing.T) {
+func TestCalculateAutomaticMaxConcurrentLeavesDesktopCPUHeadroom(t *testing.T) {
 	got := calculateAutomaticMaxConcurrentForSystem(8, 16*1024, 1024, 1024)
-	if got != 4 {
-		t.Fatalf("expected automatic max concurrency 4, got %d", got)
+	if got != 2 {
+		t.Fatalf("expected automatic max concurrency 2, got %d", got)
 	}
 }
 
@@ -5772,8 +6696,43 @@ func TestCalculateCapacitySnapshotUsesObservedWorkerResources(t *testing.T) {
 	if snapshot.CurrentRunningAgents != 2 {
 		t.Fatalf("expected running agents 2, got %d", snapshot.CurrentRunningAgents)
 	}
-	if snapshot.MaxParallelAgents != 3 {
-		t.Fatalf("expected parallel agents 3, got %d", snapshot.MaxParallelAgents)
+	if snapshot.MaxParallelAgents != 2 {
+		t.Fatalf("expected parallel agents 2, got %d", snapshot.MaxParallelAgents)
+	}
+}
+
+func TestNewRuntimeCommandRunsAgentsAtLowerPriorityByDefault(t *testing.T) {
+	_ = os.Unsetenv("PASSIVEAGENTS_AGENT_NICE")
+	t.Cleanup(func() {
+		_ = os.Unsetenv("PASSIVEAGENTS_AGENT_NICE")
+	})
+
+	cmd := newRuntimeCommand("echo hello")
+	if len(cmd.Args) < 5 {
+		t.Fatalf("expected nice-wrapped command, got args=%v", cmd.Args)
+	}
+	if cmd.Args[0] != "nice" || cmd.Args[1] != "-n" || cmd.Args[2] != strconv.Itoa(defaultAgentNiceValue) {
+		t.Fatalf("expected default nice wrapper, got args=%v", cmd.Args)
+	}
+	if cmd.Args[3] != "sh" || cmd.Args[4] != "-lc" {
+		t.Fatalf("expected shell under nice wrapper, got args=%v", cmd.Args)
+	}
+}
+
+func TestNewRuntimeCommandCanDisablePriorityWrapper(t *testing.T) {
+	if err := os.Setenv("PASSIVEAGENTS_AGENT_NICE", "0"); err != nil {
+		t.Fatalf("set env failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Unsetenv("PASSIVEAGENTS_AGENT_NICE")
+	})
+
+	cmd := newRuntimeCommand("echo hello")
+	if len(cmd.Args) < 3 {
+		t.Fatalf("expected shell command, got args=%v", cmd.Args)
+	}
+	if cmd.Args[0] != "sh" || cmd.Args[1] != "-lc" {
+		t.Fatalf("expected direct shell command when nice wrapper is disabled, got args=%v", cmd.Args)
 	}
 }
 
@@ -5809,8 +6768,8 @@ func TestRequestGracefulWorkerShutdownWritesPersistPrompt(t *testing.T) {
 	if got := input.String(); !strings.Contains(got, "write any new progress to TASK_CONTEXT.md") {
 		t.Fatalf("expected shutdown prompt to mention TASK_CONTEXT.md, got %q", got)
 	}
-	if got := input.String(); !strings.Contains(got, "lessons.md") {
-		t.Fatalf("expected shutdown prompt to mention lessons.md, got %q", got)
+	if got := input.String(); !strings.Contains(got, "lessons.jsonl") {
+		t.Fatalf("expected shutdown prompt to mention lessons.jsonl, got %q", got)
 	}
 	shutdownRequested, shutdownPrompt, shutdownMode := w.shutdownRequestDetails()
 	if !shutdownRequested {
@@ -5846,16 +6805,18 @@ func TestRequestManagerRestartWorkerShutdownMarksRestartMode(t *testing.T) {
 	if shutdownMode != shutdownModeManagerRestart {
 		t.Fatalf("unexpected shutdown mode %q", shutdownMode)
 	}
-	if !strings.Contains(shutdownPrompt, "lessons.md") {
+	if !strings.Contains(shutdownPrompt, "lessons.jsonl") {
 		t.Fatalf("unexpected shutdown prompt %q", shutdownPrompt)
 	}
 }
 
 func TestLoadPersonaLessonsFileUsesStablePersonaIDPath(t *testing.T) {
 	tempDir := t.TempDir()
+	globalPath := filepath.Join(tempDir, "lessons.jsonl")
 	mgr := &manager{
 		cfg: config{
-			LessonsBaseDir: tempDir,
+			LessonsBaseDir:   filepath.Join(tempDir, "agents"),
+			LessonsJSONLFile: globalPath,
 		},
 	}
 
@@ -5863,16 +6824,15 @@ func TestLoadPersonaLessonsFileUsesStablePersonaIDPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadPersonaLessonsFile error: %v", err)
 	}
-	if !strings.Contains(content, "# Lessons Learned") {
-		t.Fatalf("expected initialized lessons file content, got %q", content)
+	if content != "" {
+		t.Fatalf("expected empty initialized lessons jsonl content, got %q", content)
 	}
 	if hash == "" {
 		t.Fatalf("expected content hash")
 	}
 
-	path := filepath.Join(tempDir, "550e8400-e29b-41d4-a716-446655440000", "lessons.md")
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("expected lessons file at stable ID path: %v", err)
+	if _, err := os.Stat(globalPath); err != nil {
+		t.Fatalf("expected global lessons jsonl file: %v", err)
 	}
 }
 
@@ -5984,6 +6944,130 @@ func TestLoadPersonaLessonsFileRejectsInvalidPersonaID(t *testing.T) {
 	}
 }
 
+func TestPersistWorkerLessonsToPersonaMergesWorktreeJSONLIntoGlobalFile(t *testing.T) {
+	tempDir := t.TempDir()
+	personaID := "550e8400-e29b-41d4-a716-446655440000"
+	globalPath := filepath.Join(tempDir, "lessons.jsonl")
+	mgr := &manager{
+		cfg: config{
+			LessonsBaseDir:   filepath.Join(tempDir, "agents"),
+			LessonsJSONLFile: globalPath,
+		},
+	}
+
+	initial := lessonJSONLRecord{
+		AgentPersonaID: personaID,
+		Lesson:         "Keep fixes small.",
+		Source:         "AGENT",
+		CreatedAt:      "2026-04-22T00:00:00Z",
+	}
+	initialRaw, err := json.Marshal(initial)
+	if err != nil {
+		t.Fatalf("marshal initial lesson: %v", err)
+	}
+	if err := writeFileAtomic(globalPath, append(initialRaw, '\n'), 0o600, 0o700); err != nil {
+		t.Fatalf("write canonical lessons: %v", err)
+	}
+
+	workingDir := filepath.Join(tempDir, "worktree")
+	workspaceLessonsPath := filepath.Join(workingDir, "lessons.jsonl")
+	workspaceRaw := strings.Join([]string{
+		`{"lesson":"Keep fixes small."}`,
+		`{"lesson":"Copy worktree lessons back before sync."}`,
+		"",
+	}, "\n")
+	if err := writeFileAtomic(workspaceLessonsPath, []byte(workspaceRaw), 0o600, 0o700); err != nil {
+		t.Fatalf("write workspace lessons: %v", err)
+	}
+
+	if err := mgr.persistWorkerLessonsToPersona(personaID, workingDir); err != nil {
+		t.Fatalf("persistWorkerLessonsToPersona error: %v", err)
+	}
+
+	records, err := mgr.loadGlobalLessonRecords()
+	if err != nil {
+		t.Fatalf("read canonical lessons: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records, got %d: %#v", len(records), records)
+	}
+	if records[0].Lesson != "Keep fixes small." {
+		t.Fatalf("expected first lesson to be preserved, got %q", records[0].Lesson)
+	}
+	if records[1].AgentPersonaID != personaID || records[1].Lesson != "Copy worktree lessons back before sync." {
+		t.Fatalf("unexpected appended lesson: %#v", records[1])
+	}
+}
+
+func TestPersistWorkerLessonsToPersonaIgnoresLegacyMarkdown(t *testing.T) {
+	tempDir := t.TempDir()
+	personaID := "550e8400-e29b-41d4-a716-446655440000"
+	globalPath := filepath.Join(tempDir, "lessons.jsonl")
+	mgr := &manager{
+		cfg: config{
+			LessonsBaseDir:   filepath.Join(tempDir, "agents"),
+			LessonsJSONLFile: globalPath,
+		},
+	}
+
+	workingDir := filepath.Join(tempDir, "worktree")
+	workspaceLessonsPath := filepath.Join(workingDir, "lessons.md")
+	if err := writeFileAtomic(workspaceLessonsPath, []byte(strings.Join([]string{
+		"# Lessons Learned",
+		"",
+		"- Preserve old lessons files during migration.",
+		"",
+	}, "\n")), 0o600, 0o700); err != nil {
+		t.Fatalf("write workspace lessons: %v", err)
+	}
+
+	if err := mgr.persistWorkerLessonsToPersona(personaID, workingDir); err != nil {
+		t.Fatalf("persistWorkerLessonsToPersona error: %v", err)
+	}
+
+	records, err := mgr.loadGlobalLessonRecords()
+	if err != nil {
+		t.Fatalf("load global lessons: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected legacy markdown file to be ignored, got %#v", records)
+	}
+}
+
+func TestPersistWorkerLessonsToPersonaRejectsInvalidJSONL(t *testing.T) {
+	tempDir := t.TempDir()
+	personaID := "550e8400-e29b-41d4-a716-446655440000"
+	mgr := &manager{
+		cfg: config{
+			LessonsBaseDir:   filepath.Join(tempDir, "agents"),
+			LessonsJSONLFile: filepath.Join(tempDir, "lessons.jsonl"),
+		},
+	}
+
+	workingDir := filepath.Join(tempDir, "worktree")
+	workspaceLessonsPath := filepath.Join(workingDir, "lessons.jsonl")
+	if err := writeFileAtomic(workspaceLessonsPath, []byte("- Preserve old lessons files during migration.\n"), 0o600, 0o700); err != nil {
+		t.Fatalf("write workspace lessons: %v", err)
+	}
+
+	if err := mgr.persistWorkerLessonsToPersona(personaID, workingDir); err == nil {
+		t.Fatal("expected invalid jsonl error")
+	}
+}
+
+func TestClampPTYDimensionsEnforcesMinimumBrowserSafeSize(t *testing.T) {
+	cols, rows, clipped := clampPTYDimensions(1, 2)
+	if !clipped {
+		t.Fatal("expected tiny PTY dimensions to be clamped")
+	}
+	if cols < 80 {
+		t.Fatalf("expected cols to be clamped to a safe minimum, got %d", cols)
+	}
+	if rows < 8 {
+		t.Fatalf("expected rows to be clamped to a safe minimum, got %d", rows)
+	}
+}
+
 func TestWritePersonaPromptFileUsesStablePersonaIDPath(t *testing.T) {
 	tempDir := t.TempDir()
 	mgr := &manager{
@@ -5999,7 +7083,7 @@ func TestWritePersonaPromptFileUsesStablePersonaIDPath(t *testing.T) {
 			Role:         "Backend Engineer",
 			Instructions: "Implement backend changes carefully",
 		},
-		filepath.Join(tempDir, "550e8400-e29b-41d4-a716-446655440000", "lessons.md"),
+		filepath.Join(tempDir, "550e8400-e29b-41d4-a716-446655440000", "lessons.jsonl"),
 	)
 	if err != nil {
 		t.Fatalf("writePersonaPromptFile error: %v", err)
@@ -6045,9 +7129,37 @@ func TestWritePollSnapshotPersistsTasksAndPersonas(t *testing.T) {
 	}
 }
 
+func TestChoosePersonaForTaskUsesRunnablePersonaForOpenTask(t *testing.T) {
+	personas := []apiAgentPersona{
+		{ID: "agent-without-runtime", Name: "Draft Agent"},
+		{ID: "agent-runnable", Name: "Runnable Agent", RuntimeID: "runtime-1"},
+	}
+
+	got := choosePersonaForTask(personas, apiTask{ID: "task-1"})
+
+	if got == nil || got.ID != "agent-runnable" {
+		t.Fatalf("expected runnable persona, got %#v", got)
+	}
+}
+
+func TestChoosePersonaForTaskUsesRunnableEligiblePersona(t *testing.T) {
+	personas := []apiAgentPersona{
+		{ID: "agent-without-runtime", Name: "Draft Agent"},
+		{ID: "agent-runnable", Name: "Runnable Agent", RuntimeID: "runtime-1"},
+	}
+
+	got := choosePersonaForTask(personas, apiTask{
+		ID:               "task-1",
+		EligibleAgentIDs: []string{"agent-without-runtime", "agent-runnable"},
+	})
+
+	if got == nil || got.ID != "agent-runnable" {
+		t.Fatalf("expected runnable eligible persona, got %#v", got)
+	}
+}
+
 func TestPollOnceSpawnsAgentStreamsLogsAndCompletesTaskLocally(t *testing.T) {
 	var mu sync.Mutex
-	logLines := make([]string, 0)
 	updated := false
 	syncedLessons := false
 	var registeredAgentID string
@@ -6056,7 +7168,7 @@ func TestPollOnceSpawnsAgentStreamsLogsAndCompletesTaskLocally(t *testing.T) {
 	var claimedAgentID string
 	triangleOutPath := filepath.Join(t.TempDir(), "triangle.txt")
 	triangleCommand := fmt.Sprintf(
-		"printf '*\\n**\\n***\\n' | tee %q; echo TRIANGLE_DONE",
+		"sleep 6; printf '*\\n**\\n***\\n' | tee %q; echo '[TASK_COMPLETED] rendered triangle'",
 		triangleOutPath,
 	)
 
@@ -6091,19 +7203,6 @@ func TestPollOnceSpawnsAgentStreamsLogsAndCompletesTaskLocally(t *testing.T) {
 			claimedAgentID = payload.AgentID
 			mu.Unlock()
 			return jsonHTTPResponse(200, `{"claimed":true}`), nil
-		case r.Method == http.MethodPost && r.URL.Path == "/api/logs/batch":
-			var payload struct {
-				Logs []struct {
-					Line string `json:"line"`
-				} `json:"logs"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&payload)
-			mu.Lock()
-			for _, entry := range payload.Logs {
-				logLines = append(logLines, entry.Line)
-			}
-			mu.Unlock()
-			return jsonHTTPResponse(200, `{}`), nil
 		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/instance-1/update-task":
 			mu.Lock()
 			updated = true
@@ -6155,7 +7254,6 @@ func TestPollOnceSpawnsAgentStreamsLogsAndCompletesTaskLocally(t *testing.T) {
 		mu.Lock()
 		done := updated
 		sawLessonSync := syncedLessons
-		currentLogs := strings.Join(logLines, "\n")
 		currentRegisteredAgentID := registeredAgentID
 		currentRegisteredRuntimeID := registeredRuntimeID
 		currentClaimedTaskID := claimedTaskID
@@ -6179,7 +7277,8 @@ func TestPollOnceSpawnsAgentStreamsLogsAndCompletesTaskLocally(t *testing.T) {
 			if statErr != nil {
 				t.Fatalf("expected poll snapshot file: %v", statErr)
 			}
-			if len(strings.TrimSpace(currentLogs)) > 0 {
+			rawLogs, readLogsErr := os.ReadFile(filepath.Join(tempDir, "instances", "instance-1", "logs.raw"))
+			if readLogsErr == nil && strings.TrimSpace(string(rawLogs)) != "" {
 				rawTriangle, readErr := os.ReadFile(triangleOutPath)
 				if readErr != nil {
 					t.Fatalf("expected triangle output file: %v", readErr)
@@ -6254,6 +7353,7 @@ func TestSpawnWorkerLeavesTaskReadyWhenAgentClaimFails(t *testing.T) {
 
 func TestSpawnWorkerPersistsTaskWorkingDirectoryImmediatelyAfterClaim(t *testing.T) {
 	claimAttempted := false
+	claimedWorkingDir := ""
 	persistedWorkingDir := ""
 	sawClaimStatePersist := false
 	persistedTaskID := ""
@@ -6268,7 +7368,14 @@ func TestSpawnWorkerPersistsTaskWorkingDirectoryImmediatelyAfterClaim(t *testing
 		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/register":
 			return jsonHTTPResponse(200, `{"id":"instance-1"}`), nil
 		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/instance-1/claim-task":
+			var payload struct {
+				WorkingDirectory string `json:"workingDirectory"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode claim-task payload: %v", err)
+			}
 			claimAttempted = true
+			claimedWorkingDir = payload.WorkingDirectory
 			return jsonHTTPResponse(200, `{"claimed":true}`), nil
 		case r.Method == http.MethodPost && r.URL.Path == "/agent-instances/instance-1/update-task":
 			var payload struct {
@@ -6332,6 +7439,9 @@ func TestSpawnWorkerPersistsTaskWorkingDirectoryImmediatelyAfterClaim(t *testing
 	)
 	if !claimAttempted {
 		t.Fatalf("expected agent claim attempt")
+	}
+	if claimedWorkingDir != tempDir {
+		t.Fatalf("expected claim working directory %q, got %q", tempDir, claimedWorkingDir)
 	}
 	if !sawClaimStatePersist {
 		t.Fatalf("expected a claim-state persistence call")

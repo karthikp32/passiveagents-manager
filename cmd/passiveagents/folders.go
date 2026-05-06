@@ -86,7 +86,7 @@ func (m *manager) addAllowedFolder(ctx context.Context, inputPath, label string)
 		return allowedFolder{}, fmt.Errorf("manager id is not initialized")
 	}
 	payload := map[string]any{
-		"displayPath": strings.TrimSpace(inputPath),
+		"displayPath": stripWrappingQuotes(strings.TrimSpace(inputPath)),
 		"label":       normalized.Label,
 		"isGitRepo":   normalized.IsGitRepo,
 	}
@@ -227,7 +227,7 @@ func (m *manager) refreshAllowedFoldersFromBackendDetailed(ctx context.Context) 
 			m.logWarn(
 				"allowed_folder_refresh_skip folder_id=%s path=%q err=%v",
 				strings.TrimSpace(record.ID),
-				strings.TrimSpace(record.DisplayPath),
+				stripWrappingQuotes(strings.TrimSpace(record.DisplayPath)),
 				buildErr,
 			)
 			continue
@@ -305,7 +305,8 @@ func (m *manager) resolveSelectedAllowedFolder(ctx context.Context, folderID str
 }
 
 func buildAllowedFolderFromRecord(record apiManagerFolderRecord) (allowedFolder, error) {
-	canonicalPath, err := canonicalizeDirectoryPath(record.DisplayPath)
+	displayPath := stripWrappingQuotes(record.DisplayPath)
+	canonicalPath, err := canonicalizeDirectoryPath(displayPath)
 	if err != nil {
 		return allowedFolder{}, err
 	}
@@ -331,7 +332,7 @@ func buildAllowedFolderFromRecord(record apiManagerFolderRecord) (allowedFolder,
 }
 
 func describeAllowedFolderRecordError(record apiManagerFolderRecord, err error) error {
-	return describeLocalFolderError(strings.TrimSpace(record.DisplayPath), err)
+	return describeLocalFolderError(stripWrappingQuotes(record.DisplayPath), err)
 }
 
 func describeLocalFolderError(displayPath string, err error) error {
@@ -571,7 +572,7 @@ func existingWorktreePathForBranch(repoPath, branchName string) (string, error) 
 }
 
 func canonicalizeDirectoryPath(path string) (string, error) {
-	path = strings.TrimSpace(path)
+	path = stripWrappingQuotes(path)
 	if path == "" {
 		return "", fmt.Errorf("folder path is required")
 	}
@@ -604,6 +605,19 @@ func canonicalizeDirectoryPath(path string) (string, error) {
 		return "", fmt.Errorf("folder path must be a directory")
 	}
 	return cleaned, nil
+}
+
+func stripWrappingQuotes(value string) string {
+	next := strings.TrimSpace(value)
+	for len(next) >= 2 {
+		first := next[0]
+		last := next[len(next)-1]
+		if (first != '\'' || last != '\'') && (first != '"' || last != '"') {
+			break
+		}
+		next = strings.TrimSpace(next[1 : len(next)-1])
+	}
+	return next
 }
 
 func detectGitRepo(path string) (bool, error) {

@@ -213,6 +213,48 @@ func TestRefreshAllowedFoldersFromBackendHydratesLocalState(t *testing.T) {
 	}
 }
 
+func TestRefreshAllowedFoldersFromBackendStripsQuotedDisplayPath(t *testing.T) {
+	allowedDir := t.TempDir()
+	stateFile := filepath.Join(t.TempDir(), "manager-state.json")
+	mgr := &manager{
+		cfg: config{
+			APIBaseURL: "http://example.test",
+			StateFile:  stateFile,
+			UserJWT:    "token",
+		},
+		state: persistedState{
+			ManagerID:      "manager-1",
+			AllowedFolders: []allowedFolder{},
+		},
+		client: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return testJSONResponse(t, http.StatusOK, []map[string]any{
+					{
+						"id":                     "550e8400-e29b-41d4-a716-446655440010",
+						"label":                  "Passive Agents",
+						"display_path":           "'" + allowedDir + "'",
+						"is_git_repo":            false,
+						"local_agent_manager_id": "manager-1",
+					},
+				}), nil
+			}),
+		},
+	}
+	if err := writeState(stateFile, mgr.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+
+	if err := mgr.refreshAllowedFoldersFromBackend(context.Background()); err != nil {
+		t.Fatalf("refreshAllowedFoldersFromBackend error: %v", err)
+	}
+	if len(mgr.state.AllowedFolders) != 1 {
+		t.Fatalf("expected 1 allowlisted folder, got %d", len(mgr.state.AllowedFolders))
+	}
+	if mgr.state.AllowedFolders[0].AbsolutePath != allowedDir {
+		t.Fatalf("unexpected absolute path: %s", mgr.state.AllowedFolders[0].AbsolutePath)
+	}
+}
+
 func TestAddAllowedFolderCreatesBackendRowAndRefreshesLocalState(t *testing.T) {
 	allowedDir := t.TempDir()
 	mgr := &manager{
