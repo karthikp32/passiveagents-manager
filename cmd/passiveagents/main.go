@@ -628,10 +628,21 @@ type apiTask struct {
 }
 
 type apiTaskCheckpoint struct {
-	ID             string `json:"id"`
-	CheckpointType string `json:"checkpoint_type"`
-	CheckpointText string `json:"checkpoint_text"`
-	CreatedAt      string `json:"created_at"`
+	ID              string `json:"id"`
+	CheckpointType  string `json:"checkpoint_type"`
+	CheckpointText  string `json:"checkpoint_text"`
+	CreatedAt       string `json:"created_at"`
+	TaskID          string `json:"task_id,omitempty"`
+	AgentID         string `json:"agent_id,omitempty"`
+	AgentInstanceID string `json:"agent_instance_id,omitempty"`
+	Metadata        any    `json:"metadata,omitempty"`
+}
+
+type taskCheckpointJSONLRecord struct {
+	Timestamp       string `json:"timestamp"`
+	CheckpointText  string `json:"checkpoint_text"`
+	AgentID         string `json:"agent_id,omitempty"`
+	AgentInstanceID string `json:"agent_instance_id,omitempty"`
 }
 
 type clientBootstrapConfig struct {
@@ -1649,6 +1660,9 @@ func (m *manager) handleManagerConnection(ctx context.Context, client *browserCl
 			Path            string `json:"path"`
 			Label           string `json:"label"`
 			ReplyTo         string `json:"reply_to"`
+			RefreshToken    string `json:"refresh_token"`
+			ExpiresAt       int64  `json:"expires_at"`
+			UserID          string `json:"user_id"`
 			Data            string `json:"data"`
 			MessageType     string `json:"message_type"`
 			Text            string `json:"text"`
@@ -1674,6 +1688,17 @@ func (m *manager) handleManagerConnection(ctx context.Context, client *browserCl
 				return
 			}
 			_ = m.writeBrowserEvents(client, map[string]any{"type": "authenticated"}, m.currentManagerAuthStatePayload())
+		case "sync_user_session":
+			if !browserClientAuthenticated(client) {
+				_ = m.writeBrowserEvent(client, map[string]any{
+					"type":    "error",
+					"message": "manager websocket is not authenticated",
+				})
+				return
+			}
+			if err := m.handleBrowserSyncUserSession(ctx, envelope.AccessToken, envelope.RefreshToken, envelope.ExpiresAt, envelope.UserID); err != nil {
+				m.logWarn("handle_browser_sync_user_session_failed err=%v", err)
+			}
 		case "subscribe_instance":
 			if !browserClientAuthenticated(client) {
 				_ = m.writeBrowserEvent(client, map[string]any{
@@ -1912,6 +1937,66 @@ func (m *manager) authenticateBrowserClient(ctx context.Context, client *browser
 	return nil
 }
 
+func (m *manager) handleBrowserSyncUserSession(ctx context.Context, accessToken, refreshToken string, expiresAt int64, userID string) error {
+	accessToken = strings.TrimSpace(accessToken)
+	refreshToken = strings.TrimSpace(refreshToken)
+	userID = strings.TrimSpace(userID)
+	if accessToken == "" || refreshToken == "" || expiresAt <= 0 || userID == "" {
+		return fmt.Errorf("invalid browser session")
+	}
+
+	claims, err := m.validateSupabaseJWT(accessToken)
+	if err != nil {
+		return fmt.Errorf("invalid browser access token")
+	}
+	tokenUserID := strings.TrimSpace(claimString(claims, "sub"))
+	if tokenUserID == "" || tokenUserID != userID {
+		return fmt.Errorf("browser session user mismatch")
+	}
+	if managerUserID := m.cachedManagerUserID(); managerUserID != "" && managerUserID != userID {
+		return fmt.Errorf("browser session does not match the manager account")
+	}
+
+	session := storedSession{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ExpiresAt:    expiresAt,
+		UserID:       userID,
+		UserEmail:    claimString(claims, "email"),
+	}
+	if err := m.saveSession(session); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.userID = userID
+	needsAuthStateClear := m.state.AuthRequired ||
+		strings.TrimSpace(m.state.ReauthSessionID) != "" ||
+		strings.TrimSpace(m.state.ReauthCodeVerifier) != ""
+	m.mu.Unlock()
+	if needsAuthStateClear {
+		if err := m.updateManagerAuthState(false, "", ""); err != nil {
+			return err
+		}
+	}
+	if err := m.syncRegisteredManagerSession(ctx); err != nil {
+		m.logWarn("manager_session_sync_after_browser_session_sync_failed manager_id=%s err=%v", strings.TrimSpace(m.state.ManagerID), err)
+	}
+	return nil
+}
+
+func (m *manager) cachedManagerUserID() string {
+	m.mu.Lock()
+	userID := strings.TrimSpace(m.userID)
+	m.mu.Unlock()
+	if userID != "" {
+		return userID
+	}
+	if session, err := m.loadSession(); err == nil {
+		return strings.TrimSpace(session.UserID)
+	}
+	return ""
+}
+
 func (m *manager) currentManagerUserID(ctx context.Context) (string, error) {
 	m.mu.Lock()
 	userID := strings.TrimSpace(m.userID)
@@ -2064,6 +2149,30 @@ func (m *manager) sendInitialStatesForInstance(client *browserClient, instanceID
 	}
 	_ = m.writeBrowserEvent(client, livestreamPayload)
 	_ = m.writeBrowserEvent(client, agentPayload)
+	m.sendTaskCheckpointsForInstance(client, instanceID)
+}
+
+func (m *manager) sendTaskCheckpointsForInstance(client *browserClient, instanceID string) {
+	instanceID = strings.TrimSpace(instanceID)
+	if instanceID == "" {
+		return
+	}
+	m.mu.Lock()
+	w, ok := m.workers[instanceID]
+	m.mu.Unlock()
+	if !ok || w == nil || strings.TrimSpace(w.taskID) == "" || strings.TrimSpace(w.workingDir) == "" {
+		return
+	}
+	records, err := loadTaskCheckpointJSONL(filepath.Join(w.workingDir, "task_checkpoints.jsonl"))
+	if err != nil {
+		return
+	}
+	_ = m.writeBrowserEvent(client, map[string]any{
+		"type":        "task_checkpoints",
+		"instance_id": instanceID,
+		"task_id":     w.taskID,
+		"checkpoints": taskCheckpointRecordsToAPI(w.taskID, instanceID, records),
+	})
 }
 
 func (m *manager) persistedWorkerForInstance(instanceID string) (persistedWorker, bool) {
@@ -2740,7 +2849,7 @@ func (m *manager) currentCapacitySnapshot() capacitySnapshot {
 }
 
 func buildGracefulShutdownPrompt() string {
-	return "Before you shut down, read TASK_CONTEXT.md to understand previous checkpoints, write any new progress to TASK_CONTEXT.md and append a new JSON object with a new lesson field to lessons.jsonl, then exit. Aim to append a new lesson that will help your performance on similar types of tasks in the future. If the task was very simple, don't append a new lesson."
+	return "Before you shut down, read TASK_CONTEXT.md and task_checkpoints.jsonl to understand previous checkpoints. Do not ask the user for permission or confirmation; complete these persistence steps immediately. Append 1-5 new progress checkpoints to task_checkpoints.jsonl as JSON lines using {\"timestamp\":\"RFC3339\",\"checkpoint_text\":\"...\"}. Each checkpoint_text must be one clear, concise, human-readable sentence about useful task progress, decisions, blockers, files changed, tests run, or next steps. Do not copy terminal output, prompts, status spinners, thinking text, markdown fences, or shutdown instructions into checkpoint_text. Then append a new JSON object with a new lesson field to lessons.jsonl. Aim to append a new lesson that will help your performance on similar types of tasks in the future. If the task was very simple, don't append a new lesson."
 }
 
 func workerShutdownStatusMessage(mode string) string {
@@ -3085,6 +3194,13 @@ func (m *manager) computeAgentState(instanceID string) (state, message string) {
 	}
 	// User has taken over (livestream ready) — show current output and return working state
 	status := workerPromptStatusForWorker(worker)
+	if status.State == workerPromptStateReadyEmpty {
+		status2 := workerAgentStatusForWorker(worker)
+		if status2 == "" {
+			status2 = "working"
+		}
+		return status2, ""
+	}
 	if strings.TrimSpace(status.Snapshot) != "" {
 		return "working", status.Snapshot
 	}
@@ -4829,6 +4945,11 @@ func buildPersonaPrompt(
 	if strings.TrimSpace(taskContextFilePath) != "" {
 		parts = append(parts, "- Task context file: "+strings.TrimSpace(taskContextFilePath))
 	}
+	parts = append(
+		parts,
+		"",
+		"Periodically append progress checkpoints to task_checkpoints.jsonl while you work, and before marking the task complete append at least one progress checkpoint if you have not already done so. Write checkpoints as JSON lines using {\"timestamp\":\"RFC3339\",\"checkpoint_text\":\"...\"}. Each checkpoint_text must be one clear, concise, human-readable sentence about useful task progress, decisions, blockers, files changed, tests run, or next steps. Do not copy terminal output, prompts, status spinners, thinking text, markdown fences, or lifecycle instructions into checkpoint_text.",
+	)
 	parts = append(parts, "", buildTaskContextDocument(task, checkpoints))
 	return strings.Join(parts, "\n\n")
 }
@@ -4970,6 +5091,213 @@ func buildTaskContextDocument(
 	return strings.Join(parts, "\n\n") + "\n"
 }
 
+func buildTaskCheckpointJSONL(checkpoints []apiTaskCheckpoint) string {
+	return buildTaskCheckpointJSONLFromRecords(apiTaskCheckpointsToJSONLRecords(checkpoints))
+}
+
+func apiTaskCheckpointsToJSONLRecords(checkpoints []apiTaskCheckpoint) []taskCheckpointJSONLRecord {
+	if len(checkpoints) == 0 {
+		return nil
+	}
+
+	records := make([]taskCheckpointJSONLRecord, 0, len(checkpoints))
+	for _, checkpoint := range checkpoints {
+		text := normalizeTaskCheckpointJSONLText(checkpoint.CheckpointText)
+		timestamp := strings.TrimSpace(checkpoint.CreatedAt)
+		parsedAt, err := time.Parse(time.RFC3339Nano, timestamp)
+		if text == "" || timestamp == "" || err != nil || parsedAt.IsZero() {
+			continue
+		}
+		records = append(records, taskCheckpointJSONLRecord{
+			Timestamp:      timestamp,
+			CheckpointText: text,
+		})
+	}
+	return records
+}
+
+func buildTaskCheckpointJSONLFromRecords(records []taskCheckpointJSONLRecord) string {
+	if len(records) == 0 {
+		return ""
+	}
+
+	cleaned := make([]taskCheckpointJSONLRecord, 0, len(records))
+	seen := map[string]struct{}{}
+	for _, record := range records {
+		text := normalizeTaskCheckpointJSONLText(record.CheckpointText)
+		timestamp := strings.TrimSpace(record.Timestamp)
+		parsedAt, err := time.Parse(time.RFC3339Nano, timestamp)
+		if text == "" || timestamp == "" || err != nil || parsedAt.IsZero() {
+			continue
+		}
+		key := timestamp + "\n" + text
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		cleaned = append(cleaned, taskCheckpointJSONLRecord{
+			Timestamp:      timestamp,
+			CheckpointText: text,
+		})
+	}
+
+	if len(cleaned) == 0 {
+		return ""
+	}
+
+	sort.SliceStable(cleaned, func(i, j int) bool {
+		leftAt, leftErr := time.Parse(time.RFC3339Nano, cleaned[i].Timestamp)
+		rightAt, rightErr := time.Parse(time.RFC3339Nano, cleaned[j].Timestamp)
+		switch {
+		case leftErr != nil && rightErr != nil:
+			return cleaned[i].Timestamp < cleaned[j].Timestamp
+		case leftErr != nil:
+			return false
+		case rightErr != nil:
+			return true
+		case !leftAt.Equal(rightAt):
+			return leftAt.Before(rightAt)
+		default:
+			return cleaned[i].CheckpointText < cleaned[j].CheckpointText
+		}
+	})
+
+	lines := make([]string, 0, len(cleaned))
+	for _, record := range cleaned {
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			continue
+		}
+		lines = append(lines, string(encoded))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func mergeTaskCheckpointJSONL(checkpointPath string, checkpoints []apiTaskCheckpoint) (string, error) {
+	records, err := mergedTaskCheckpointJSONLRecords(checkpointPath, checkpoints)
+	if err != nil {
+		return "", err
+	}
+	return buildTaskCheckpointJSONLFromRecords(records), nil
+}
+
+func mergedTaskCheckpointJSONLRecords(checkpointPath string, checkpoints []apiTaskCheckpoint) ([]taskCheckpointJSONLRecord, error) {
+	records := apiTaskCheckpointsToJSONLRecords(checkpoints)
+	existingRecords, err := loadTaskCheckpointJSONL(checkpointPath)
+	if err != nil {
+		return nil, err
+	}
+	records = append(records, existingRecords...)
+	mergedJSONL := buildTaskCheckpointJSONLFromRecords(records)
+	if strings.TrimSpace(mergedJSONL) == "" {
+		return nil, nil
+	}
+	return loadTaskCheckpointJSONLFromReader(strings.NewReader(mergedJSONL))
+}
+
+func loadTaskCheckpointJSONL(path string) ([]taskCheckpointJSONLRecord, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	return loadTaskCheckpointJSONLFromReader(bytes.NewReader(raw))
+}
+
+func loadTaskCheckpointJSONLFromReader(reader io.Reader) ([]taskCheckpointJSONLRecord, error) {
+	scanner := bufio.NewScanner(reader)
+	records := make([]taskCheckpointJSONLRecord, 0, 8)
+	seen := map[string]struct{}{}
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var record taskCheckpointJSONLRecord
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			return nil, fmt.Errorf("parse task checkpoint jsonl: %w", err)
+		}
+		record.Timestamp = strings.TrimSpace(record.Timestamp)
+		record.CheckpointText = normalizeTaskCheckpointJSONLText(record.CheckpointText)
+		if record.Timestamp == "" ||
+			record.CheckpointText == "" ||
+			taskCheckpointTimestampInvalid(record.Timestamp) {
+			continue
+		}
+		key := record.Timestamp + "\n" + record.CheckpointText
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		records = append(records, record)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+func normalizeTaskCheckpointJSONLText(value string) string {
+	value = strings.TrimSpace(sanitizeTerminalFragment(value))
+	value = strings.Join(strings.Fields(value), " ")
+	value = strings.Trim(value, "`")
+	value = strings.TrimSpace(value)
+	if value == "" || isNoisyTaskCheckpointText(value) {
+		return ""
+	}
+	const maxCheckpointTextLen = 500
+	if len([]rune(value)) > maxCheckpointTextLen {
+		value = strings.TrimSpace(string([]rune(value)[:maxCheckpointTextLen]))
+	}
+	return value
+}
+
+func isNoisyTaskCheckpointText(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if lower == "" {
+		return true
+	}
+	if strings.Contains(lower, "last output:") ||
+		strings.Contains(lower, "thinking:") ||
+		strings.Contains(lower, "<one-paragraph") ||
+		strings.Contains(lower, "before you shut down") ||
+		strings.Contains(lower, "agent was shut down after being asked to persist progress") ||
+		strings.Contains(lower, "status spinner") {
+		return true
+	}
+	if strings.Contains(lower, "task_context.md") &&
+		(strings.Contains(lower, "lessons.jsonl") || strings.Contains(lower, "task_checkpoints.jsonl")) {
+		return true
+	}
+	if strings.Contains(value, "⬝⬝⬝") ||
+		strings.Contains(value, "╭") ||
+		strings.Contains(value, "╰") ||
+		strings.Contains(value, "│") {
+		return true
+	}
+	letters := 0
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			letters++
+		}
+	}
+	return letters < 8
+}
+
+func taskCheckpointTimestampInvalid(value string) bool {
+	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value))
+	return err != nil || parsed.IsZero()
+}
+
 func writeTaskWorkspaceFiles(
 	workingDir string,
 	persona apiAgentPersona,
@@ -5003,9 +5331,23 @@ func writeTaskWorkspaceFiles(
 	}
 
 	taskContextPath := filepath.Join(workingDir, "TASK_CONTEXT.md")
+	taskCheckpointPath := filepath.Join(workingDir, "task_checkpoints.jsonl")
+	taskCheckpointRecords, err := mergedTaskCheckpointJSONLRecords(taskCheckpointPath, checkpoints)
+	if err != nil {
+		return "", "", "", err
+	}
 	if err := writeFileAtomic(
 		taskContextPath,
-		[]byte(buildTaskContextDocument(task, checkpoints)),
+		[]byte(buildTaskContextDocument(task, taskCheckpointRecordsToAPI(task.ID, "", taskCheckpointRecords))),
+		0o600,
+		0o700,
+	); err != nil {
+		return "", "", "", err
+	}
+
+	if err := writeFileAtomic(
+		taskCheckpointPath,
+		[]byte(buildTaskCheckpointJSONLFromRecords(taskCheckpointRecords)),
 		0o600,
 		0o700,
 	); err != nil {
@@ -5329,6 +5671,7 @@ func (m *manager) trackWorker(ctx context.Context, w *worker, attachAddr string)
 	go m.listenLocalCommandsLoop(ctx, w)
 	go m.assistantSemanticLoop(w)
 	m.startIdleTimeoutLoop(w)
+	go m.taskCheckpointSyncLoop(context.Background(), w)
 }
 
 func (m *manager) fetchTaskCheckpoints(ctx context.Context, taskID string, limit int) ([]apiTaskCheckpoint, error) {
@@ -5344,6 +5687,145 @@ func (m *manager) fetchTaskCheckpoints(ctx context.Context, taskID string, limit
 		return nil, err
 	}
 	return out, nil
+}
+
+func (m *manager) syncTaskCheckpoints(ctx context.Context, taskID, workingDir, agentID, instanceID string) error {
+	taskID = strings.TrimSpace(taskID)
+	workingDir = strings.TrimSpace(workingDir)
+	if taskID == "" || workingDir == "" {
+		return nil
+	}
+
+	checkpointPath := filepath.Join(workingDir, "task_checkpoints.jsonl")
+	records, err := loadTaskCheckpointJSONL(checkpointPath)
+	if err != nil {
+		return err
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	agentID = strings.TrimSpace(agentID)
+	instanceID = strings.TrimSpace(instanceID)
+	for i := range records {
+		records[i].AgentID = agentID
+		records[i].AgentInstanceID = instanceID
+	}
+
+	path := fmt.Sprintf("/tasks/%s/task_checkpoints", taskID)
+	return m.userRequestJSON(ctx, http.MethodPut, path, records, nil)
+}
+
+const emptyTaskCheckpointFingerprint = "empty"
+
+func taskCheckpointRecordsFingerprint(records []taskCheckpointJSONLRecord) string {
+	normalized := buildTaskCheckpointJSONLFromRecords(records)
+	if strings.TrimSpace(normalized) == "" {
+		return emptyTaskCheckpointFingerprint
+	}
+	sum := sha256.Sum256([]byte(normalized))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func taskCheckpointRecordsToAPI(taskID, instanceID string, records []taskCheckpointJSONLRecord) []apiTaskCheckpoint {
+	taskID = strings.TrimSpace(taskID)
+	instanceID = strings.TrimSpace(instanceID)
+	out := make([]apiTaskCheckpoint, 0, len(records))
+	for _, record := range records {
+		text := normalizeTaskCheckpointJSONLText(record.CheckpointText)
+		timestamp := strings.TrimSpace(record.Timestamp)
+		if _, err := time.Parse(time.RFC3339Nano, timestamp); text == "" || timestamp == "" || err != nil {
+			continue
+		}
+		sum := sha256.Sum256([]byte(timestamp + "\x00" + text))
+		out = append(out, apiTaskCheckpoint{
+			ID:              fmt.Sprintf("manager-jsonl-%x", sum[:8]),
+			TaskID:          taskID,
+			AgentInstanceID: instanceID,
+			CheckpointType:  "STEP",
+			CheckpointText:  text,
+			CreatedAt:       timestamp,
+		})
+	}
+	return out
+}
+
+func (m *manager) broadcastTaskCheckpoints(instanceID, taskID string, records []taskCheckpointJSONLRecord) {
+	instanceID = strings.TrimSpace(instanceID)
+	taskID = strings.TrimSpace(taskID)
+	if instanceID == "" || taskID == "" {
+		return
+	}
+	payload := map[string]any{
+		"type":        "task_checkpoints",
+		"instance_id": instanceID,
+		"task_id":     taskID,
+		"checkpoints": taskCheckpointRecordsToAPI(taskID, instanceID, records),
+	}
+	for _, client := range m.subscribedBrowserClientsForInstance(instanceID) {
+		if err := m.writeBrowserEvent(client, payload); err != nil {
+			m.removeBrowserClient(client)
+		}
+	}
+}
+
+func (m *manager) taskCheckpointSyncLoop(ctx context.Context, w *worker) {
+	if w == nil {
+		return
+	}
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var lastBroadcastFingerprint string
+	var lastSyncedFingerprint string
+	for {
+		syncedFingerprint, broadcastFingerprint := m.syncAndBroadcastTaskCheckpoints(ctx, w, lastSyncedFingerprint, lastBroadcastFingerprint)
+		if syncedFingerprint != "" {
+			lastSyncedFingerprint = syncedFingerprint
+		}
+		if broadcastFingerprint != "" {
+			lastBroadcastFingerprint = broadcastFingerprint
+		}
+
+		select {
+		case <-ticker.C:
+		case <-w.done:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (m *manager) syncAndBroadcastTaskCheckpoints(ctx context.Context, w *worker, lastSyncedFingerprint, lastBroadcastFingerprint string) (string, string) {
+	taskID := strings.TrimSpace(w.taskID)
+	workingDir := strings.TrimSpace(w.workingDir)
+	if taskID == "" || workingDir == "" {
+		return "", ""
+	}
+
+	records, err := loadTaskCheckpointJSONL(filepath.Join(workingDir, "task_checkpoints.jsonl"))
+	if err != nil {
+		m.logWarn("task_checkpoint_load_error instance_id=%s task_id=%s err=%v", w.instanceID, taskID, err)
+		return "", ""
+	}
+	fingerprint := taskCheckpointRecordsFingerprint(records)
+
+	var syncedFingerprint string
+	if fingerprint != lastSyncedFingerprint {
+		if err := m.syncTaskCheckpoints(ctx, taskID, workingDir, w.agentID, w.instanceID); err != nil {
+			m.logWarn("task_checkpoint_sync_error instance_id=%s task_id=%s err=%v", w.instanceID, taskID, err)
+		} else {
+			syncedFingerprint = fingerprint
+		}
+	}
+
+	var broadcastFingerprint string
+	if fingerprint != lastBroadcastFingerprint {
+		m.broadcastTaskCheckpoints(w.instanceID, taskID, records)
+		broadcastFingerprint = fingerprint
+	}
+
+	return syncedFingerprint, broadcastFingerprint
 }
 
 func (m *manager) registerAgentInstance(ctx context.Context, persona apiAgentPersona, targetSlots int, preferredInstanceID string) (string, string, error) {
@@ -5721,6 +6203,9 @@ func (m *manager) scanLifecycleMarkers(ctx context.Context, w *worker, chunk str
 			m.logError("lifecycle_marker_update_error instance_id=%s marker=%s err=%v", w.instanceID, event.marker, err)
 			return
 		}
+		if err := m.syncTaskCheckpoints(ctx, w.taskID, w.workingDir, w.agentID, w.instanceID); err != nil {
+			m.logWarn("task_checkpoint_sync_error instance_id=%s task_id=%s err=%v", w.instanceID, w.taskID, err)
+		}
 		w.sawNeedsUserInput = true
 		m.logWorkerStateMilestone(w, "needs_user_input")
 		m.logInfo("lifecycle_marker instance_id=%s marker=%s", w.instanceID, event.marker)
@@ -5774,6 +6259,9 @@ func (m *manager) flushPendingTaskCompleted(
 	w.pendingTaskCompleted = ""
 	w.pendingTaskCompletedAt = time.Time{}
 	w.pendingTaskCompletedRetryAt = time.Time{}
+	if err := m.syncTaskCheckpoints(ctx, w.taskID, w.workingDir, w.agentID, w.instanceID); err != nil {
+		m.logWarn("task_checkpoint_sync_error instance_id=%s task_id=%s err=%v", w.instanceID, w.taskID, err)
+	}
 	m.persistAndSyncWorkerLessons(w)
 	m.logInfo("lifecycle_marker instance_id=%s marker=TASK_COMPLETED", w.instanceID)
 }
@@ -6867,6 +7355,9 @@ func (m *manager) monitorWorkerExit(w *worker) {
 
 	shutdownRequested, _, shutdownMode := w.shutdownRequestDetails()
 	if shutdownRequested {
+		if err := m.syncTaskCheckpoints(context.Background(), w.taskID, w.workingDir, w.agentID, w.instanceID); err != nil {
+			m.logWarn("task_checkpoint_sync_error instance_id=%s task_id=%s err=%v", w.instanceID, w.taskID, err)
+		}
 		m.persistAndSyncWorkerLessons(w)
 	}
 
@@ -6927,9 +7418,9 @@ func (m *manager) monitorWorkerExit(w *worker) {
 			m.logInfo("instance_exit instance_id=%s status=%s restartable=true", w.instanceID, status)
 			return
 		}
-		comment = "Agent was shut down after being asked to persist progress to TASK_CONTEXT.md and lessons to lessons.jsonl."
+		comment = "Agent was shut down after being asked to persist progress to task_checkpoints.jsonl and lessons to lessons.jsonl."
 		if shutdownMode == shutdownModeIdleTimeout {
-			comment = "Agent was shut down after being idle with no activity for 10 minutes. Progress persisted to TASK_CONTEXT.md."
+			comment = "Agent was shut down after being idle with no activity for 10 minutes. Progress persisted to task_checkpoints.jsonl."
 		}
 		if summary != "" {
 			comment += "\nLast output:\n" + summary
@@ -6953,6 +7444,9 @@ func (m *manager) monitorWorkerExit(w *worker) {
 		_ = m.updateTaskStatusFromLifecycle(context.Background(), w, "WAITING_FOR_USER_INPUT", comment)
 	} else if strings.TrimSpace(w.pendingTaskCompleted) != "" && !w.pendingTaskCompletedAt.IsZero() {
 		_ = m.updateTaskStatusFromLifecycle(context.Background(), w, "READY_FOR_REVIEW", w.pendingTaskCompleted)
+		if err := m.syncTaskCheckpoints(context.Background(), w.taskID, w.workingDir, w.agentID, w.instanceID); err != nil {
+			m.logWarn("task_checkpoint_sync_error instance_id=%s task_id=%s err=%v", w.instanceID, w.taskID, err)
+		}
 		m.persistAndSyncWorkerLessons(w)
 	}
 
@@ -6982,12 +7476,20 @@ func (m *manager) checkWorkerIdleTimeout(w *worker) {
 		return
 	default:
 	}
+	w.idleTimerMu.Lock()
+	wasIdleStartUnknown := w.idleStartedAt.IsZero()
+	w.idleTimerMu.Unlock()
+
 	// Call workerAgentStatusForWorker to ensure idleStartedAt is updated even
 	// when no browser clients are connected to trigger broadcastAgentState.
 	_ = workerAgentStatusForWorker(w)
 
 	w.idleTimerMu.Lock()
 	idleStarted := w.idleStartedAt
+	if wasIdleStartUnknown && !idleStarted.IsZero() {
+		idleStarted = idleStarted.Add(-workerIdleDisplayThreshold)
+		w.idleStartedAt = idleStarted
+	}
 	w.idleTimerMu.Unlock()
 
 	if idleStarted.IsZero() || time.Since(idleStarted) < workerIdleShutdownThreshold {

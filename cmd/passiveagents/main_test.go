@@ -131,6 +131,9 @@ func TestBuildPersonaPromptIncludesPersonaAndTaskFields(t *testing.T) {
 		"Add unit coverage",
 		"# Task Continuation Context",
 		"### Recent Task Checkpoints",
+		"Periodically append progress checkpoints to task_checkpoints.jsonl while you work",
+		"before marking the task complete append at least one progress checkpoint",
+		"Write checkpoints as JSON lines using {\"timestamp\":\"RFC3339\",\"checkpoint_text\":\"...\"}",
 		"Start work now. Keep responses concise and actionable.",
 	}
 	for _, part := range expectedParts {
@@ -187,6 +190,10 @@ func TestWriteTaskWorkspaceFilesCreatesBootstrapFilesInWorkingDir(t *testing.T) 
 			t.Fatalf("expected workspace bootstrap file %s to exist: %v", path, err)
 		}
 	}
+	taskCheckpointPath := filepath.Join(workingDir, "task_checkpoints.jsonl")
+	if _, err := os.Stat(taskCheckpointPath); err != nil {
+		t.Fatalf("expected task checkpoint file %s to exist: %v", taskCheckpointPath, err)
+	}
 
 	rawTaskContext, err := os.ReadFile(taskContextPath)
 	if err != nil {
@@ -194,6 +201,272 @@ func TestWriteTaskWorkspaceFilesCreatesBootstrapFilesInWorkingDir(t *testing.T) 
 	}
 	if !strings.Contains(string(rawTaskContext), "Fix manager pagination") {
 		t.Fatalf("expected task context file to include task name, got %q", string(rawTaskContext))
+	}
+
+	rawTaskCheckpoints, err := os.ReadFile(taskCheckpointPath)
+	if err != nil {
+		t.Fatalf("read task checkpoints: %v", err)
+	}
+	if strings.TrimSpace(string(rawTaskCheckpoints)) != "" {
+		t.Fatalf("expected empty task checkpoint file for empty checkpoints, got %q", string(rawTaskCheckpoints))
+	}
+}
+
+func TestBuildTaskCheckpointJSONLWritesChronologicalJSONL(t *testing.T) {
+	jsonl := buildTaskCheckpointJSONL([]apiTaskCheckpoint{
+		{
+			CreatedAt:      "2026-04-17T15:03:00.000Z",
+			CheckpointText: "Middle checkpoint",
+		},
+		{
+			CreatedAt:      "2026-04-17T15:05:00.000Z",
+			CheckpointText: "Second checkpoint",
+		},
+		{
+			CreatedAt:      "2026-04-17T15:00:00.000Z",
+			CheckpointText: "First checkpoint",
+		},
+	})
+
+	lines := strings.Split(strings.TrimSpace(jsonl), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 jsonl lines, got %d (%q)", len(lines), jsonl)
+	}
+	if !strings.Contains(lines[0], `"timestamp":"2026-04-17T15:00:00.000Z"`) {
+		t.Fatalf("expected first line to be chronological, got %q", lines[0])
+	}
+	if !strings.Contains(lines[1], `"checkpoint_text":"Middle checkpoint"`) {
+		t.Fatalf("expected second line to include middle checkpoint, got %q", lines[1])
+	}
+	if !strings.Contains(lines[2], `"checkpoint_text":"Second checkpoint"`) {
+		t.Fatalf("expected third line to include second checkpoint, got %q", lines[2])
+	}
+}
+
+func TestWriteTaskWorkspaceFilesPreservesUnsyncedLocalTaskCheckpoints(t *testing.T) {
+	workingDir := t.TempDir()
+	taskCheckpointPath := filepath.Join(workingDir, "task_checkpoints.jsonl")
+	if err := os.WriteFile(
+		taskCheckpointPath,
+		[]byte(`{"timestamp":"2026-04-17T15:03:00.000Z","checkpoint_text":"Local checkpoint not uploaded yet"}`+"\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write existing task checkpoints: %v", err)
+	}
+
+	if _, _, _, err := writeTaskWorkspaceFiles(
+		workingDir,
+		apiAgentPersona{Name: "Billy"},
+		apiTask{ID: "task-1", Name: "Fix checkpoint sync"},
+		[]apiTaskCheckpoint{
+			{
+				CreatedAt:      "2026-04-17T15:00:00.000Z",
+				CheckpointText: "Server checkpoint",
+			},
+		},
+		"",
+	); err != nil {
+		t.Fatalf("writeTaskWorkspaceFiles error: %v", err)
+	}
+
+	records, err := loadTaskCheckpointJSONL(taskCheckpointPath)
+	if err != nil {
+		t.Fatalf("loadTaskCheckpointJSONL error: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected server and local checkpoints to be preserved, got %d: %#v", len(records), records)
+	}
+	if records[0].CheckpointText != "Server checkpoint" {
+		t.Fatalf("expected server checkpoint first, got %#v", records[0])
+	}
+	if records[1].CheckpointText != "Local checkpoint not uploaded yet" {
+		t.Fatalf("expected unsynced local checkpoint to be preserved, got %#v", records[1])
+	}
+}
+
+func TestWriteTaskWorkspaceFilesIncludesUnsyncedLocalTaskCheckpointsInTaskContext(t *testing.T) {
+	workingDir := t.TempDir()
+	taskCheckpointPath := filepath.Join(workingDir, "task_checkpoints.jsonl")
+	if err := os.WriteFile(
+		taskCheckpointPath,
+		[]byte(`{"timestamp":"2026-05-09T23:20:00.000Z","checkpoint_text":"Local wake context checkpoint"}`+"\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write existing task checkpoints: %v", err)
+	}
+
+	_, _, taskContextPath, err := writeTaskWorkspaceFiles(
+		workingDir,
+		apiAgentPersona{Name: "Billy"},
+		apiTask{ID: "task-1", Name: "Resume checkpoint task"},
+		nil,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("writeTaskWorkspaceFiles error: %v", err)
+	}
+
+	rawTaskContext, err := os.ReadFile(taskContextPath)
+	if err != nil {
+		t.Fatalf("read task context: %v", err)
+	}
+	taskContext := string(rawTaskContext)
+	if !strings.Contains(taskContext, "Local wake context checkpoint") {
+		t.Fatalf("expected local JSONL checkpoint in task context, got %q", taskContext)
+	}
+	if strings.Contains(taskContext, "(none yet)") {
+		t.Fatalf("expected task context not to claim no checkpoints, got %q", taskContext)
+	}
+}
+
+func TestLoadTaskCheckpointJSONLDeduplicatesRecords(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "task_checkpoints.jsonl")
+	content := strings.Join([]string{
+		`{"timestamp":"2026-04-17T15:00:00.000Z","checkpoint_text":"First checkpoint"}`,
+		`{"timestamp":"2026-04-17T15:00:00.000Z","checkpoint_text":"First checkpoint"}`,
+		`{"timestamp":"2026-04-17T15:02:00.000Z","checkpoint_text":"Agent was shut down after being asked to persist progress to TASK_CONTEXT.md and lessons to lessons.jsonl. Last output: ⬝⬝⬝"}`,
+		`{"timestamp":"2026-04-17T15:05:00.000Z","checkpoint_text":"Second checkpoint"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write task checkpoints: %v", err)
+	}
+
+	records, err := loadTaskCheckpointJSONL(path)
+	if err != nil {
+		t.Fatalf("loadTaskCheckpointJSONL error: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 unique task checkpoints, got %d", len(records))
+	}
+}
+
+func TestNormalizeTaskCheckpointJSONLTextDropsTerminalNoise(t *testing.T) {
+	if got := normalizeTaskCheckpointJSONLText("  \x1b[32mAdded focused Task Detail tests.\x1b[0m\n"); got != "Added focused Task Detail tests." {
+		t.Fatalf("expected clean checkpoint text, got %q", got)
+	}
+	if got := normalizeTaskCheckpointJSONLText("<one-paragraph summa"); got != "" {
+		t.Fatalf("expected truncated lifecycle placeholder to be dropped, got %q", got)
+	}
+	if got := normalizeTaskCheckpointJSONLText("Before you shut down, read TASK_CONTEXT.md and append a new JSON object to lessons.jsonl."); got != "" {
+		t.Fatalf("expected shutdown instructions to be dropped, got %q", got)
+	}
+	if got := normalizeTaskCheckpointJSONLText("Thinking: I should probably check git status next."); got != "" {
+		t.Fatalf("expected thinking text to be dropped, got %q", got)
+	}
+}
+
+func TestSyncTaskCheckpointsUploadsJSONLRecords(t *testing.T) {
+	workingDir := t.TempDir()
+	path := filepath.Join(workingDir, "task_checkpoints.jsonl")
+	content := strings.Join([]string{
+		`{"timestamp":"2026-04-17T15:00:00.000Z","checkpoint_text":"First checkpoint"}`,
+		`{"timestamp":"2026-04-17T15:05:00.000Z","checkpoint_text":"Second checkpoint"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write task checkpoints: %v", err)
+	}
+
+	var received []map[string]any
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPut || r.URL.Path != "/tasks/task-1/task_checkpoints" {
+			return jsonHTTPResponse(404, `{"error":"not found"}`), nil
+		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatalf("decode task checkpoint payload: %v", err)
+		}
+		return jsonHTTPResponse(200, `[]`), nil
+	})
+
+	mgr, err := newManager(config{
+		WebBaseURL: "http://localhost:3000",
+		APIBaseURL: "http://local.test",
+		UserJWT:    "user-jwt",
+		StateFile:  filepath.Join(t.TempDir(), "manager-state.json"),
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	mgr.client = &http.Client{Transport: transport}
+
+	if err := mgr.syncTaskCheckpoints(context.Background(), "task-1", workingDir, "agent-1", "instance-1"); err != nil {
+		t.Fatalf("syncTaskCheckpoints error: %v", err)
+	}
+
+	if len(received) != 2 {
+		t.Fatalf("expected 2 uploaded checkpoints, got %d", len(received))
+	}
+	if received[0]["checkpoint_text"] != "First checkpoint" {
+		t.Fatalf("unexpected first uploaded checkpoint: %+v", received[0])
+	}
+	if received[0]["agent_id"] != "agent-1" || received[0]["agent_instance_id"] != "instance-1" {
+		t.Fatalf("expected uploaded checkpoint identity, got %+v", received[0])
+	}
+}
+
+func TestSyncAndBroadcastTaskCheckpointsUploadsChangedLocalRows(t *testing.T) {
+	workingDir := t.TempDir()
+	path := filepath.Join(workingDir, "task_checkpoints.jsonl")
+	content := strings.Join([]string{
+		`{"timestamp":"2026-04-17T15:00:00.000Z","checkpoint_text":"First checkpoint"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write task checkpoints: %v", err)
+	}
+
+	uploads := 0
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPut || r.URL.Path != "/tasks/task-1/task_checkpoints" {
+			return jsonHTTPResponse(404, `{"error":"not found"}`), nil
+		}
+		uploads++
+		return jsonHTTPResponse(200, `[]`), nil
+	})
+
+	mgr, err := newManager(config{
+		WebBaseURL: "http://localhost:3000",
+		APIBaseURL: "http://local.test",
+		UserJWT:    "user-jwt",
+		StateFile:  filepath.Join(t.TempDir(), "manager-state.json"),
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	mgr.client = &http.Client{Transport: transport}
+	w := &worker{
+		instanceID: "instance-1",
+		taskID:     "task-1",
+		workingDir: workingDir,
+	}
+
+	synced, broadcast := mgr.syncAndBroadcastTaskCheckpoints(context.Background(), w, "", "")
+	if synced == "" || broadcast == "" {
+		t.Fatalf("expected sync and broadcast fingerprints, got synced=%q broadcast=%q", synced, broadcast)
+	}
+	if uploads != 1 {
+		t.Fatalf("expected one checkpoint upload, got %d", uploads)
+	}
+
+	nextSynced, nextBroadcast := mgr.syncAndBroadcastTaskCheckpoints(context.Background(), w, synced, broadcast)
+	if nextSynced != "" || nextBroadcast != "" {
+		t.Fatalf("expected unchanged checkpoint file to no-op, got synced=%q broadcast=%q", nextSynced, nextBroadcast)
+	}
+	if uploads != 1 {
+		t.Fatalf("expected no second checkpoint upload, got %d", uploads)
+	}
+
+	if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+		t.Fatalf("clear task checkpoints: %v", err)
+	}
+	clearedSynced, clearedBroadcast := mgr.syncAndBroadcastTaskCheckpoints(context.Background(), w, synced, broadcast)
+	if clearedSynced != emptyTaskCheckpointFingerprint || clearedBroadcast != emptyTaskCheckpointFingerprint {
+		t.Fatalf("expected empty checkpoint fingerprints after clearing file, got synced=%q broadcast=%q", clearedSynced, clearedBroadcast)
+	}
+	if uploads != 1 {
+		t.Fatalf("expected clearing checkpoints not to upload empty JSONL, got %d uploads", uploads)
 	}
 }
 
@@ -576,8 +849,8 @@ func TestAwaitWorkerPromptSubmittedReturnsFalseOnTimeout(t *testing.T) {
 	}
 	setWorkerPromptSnapshotForTest(w, strings.Join([]string{
 		"Gemini CLI",
-		"› Before you shut down, read TASK_CONTEXT.md to understand previous checkpoints,",
-		"write any new progress to TASK_CONTEXT.md, then exit.",
+		"› Before you shut down, read TASK_CONTEXT.md and task_checkpoints.jsonl",
+		"Append 1-5 new progress checkpoints to task_checkpoints.jsonl",
 	}, "\n"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
@@ -743,8 +1016,8 @@ func TestRequestWorkerShutdownKillsWorkerAfterGracePeriod(t *testing.T) {
 	}
 	setWorkerPromptSnapshotForTest(w, strings.Join([]string{
 		"Gemini CLI",
-		"› Before you shut down, read TASK_CONTEXT.md to understand previous checkpoints,",
-		"write any new progress to TASK_CONTEXT.md, then exit.",
+		"› Before you shut down, read TASK_CONTEXT.md and task_checkpoints.jsonl",
+		"Append 1-5 new progress checkpoints to task_checkpoints.jsonl",
 	}, "\n"))
 
 	mgr := &manager{
@@ -994,6 +1267,60 @@ func TestWorkerAgentStatusReturnsWorkingForBusyPromptAfterInitialReadyEmpty(t *t
 
 	if got := workerAgentStatusForWorker(w); got != "working" {
 		t.Fatalf("expected busy prompt after initial ready-empty to stay working, got %q", got)
+	}
+}
+
+func TestComputeAgentStateReturnsIdleForReadyEmptyAfterDisplayThreshold(t *testing.T) {
+	w := &worker{
+		instanceID:     "instance-1",
+		usesPTY:        true,
+		runtimeCommand: "gemini --model auto",
+		outputBuffer:   &outputRingBuffer{maxSize: 4096},
+		terminalState:  newVTScreenState(80, 24),
+	}
+	w.livestreamReady.Store(true)
+	w.bootstrapObserved.Store(true)
+	w.bootstrapReadyEmptySeen.Store(true)
+	w.outputBuffer.Write("Gemini CLI\nType your message or @path\n› ")
+	w.terminalState.Write("Gemini CLI\nType your message or @path\n› ")
+	w.idleStartedAt = time.Now().Add(-workerIdleDisplayThreshold - time.Second)
+
+	mgr := &manager{workers: map[string]*worker{"instance-1": w}}
+	state, _ := mgr.computeAgentState("instance-1")
+	if state != "idle" {
+		t.Fatalf("expected ready-empty worker to be idle after display threshold, got %q", state)
+	}
+}
+
+func TestCheckWorkerIdleTimeoutBackdatesFirstReadyEmptyObservation(t *testing.T) {
+	w := &worker{
+		instanceID:     "instance-1",
+		usesPTY:        true,
+		runtimeCommand: "gemini --model auto",
+		outputBuffer:   &outputRingBuffer{maxSize: 4096},
+		terminalState:  newVTScreenState(80, 24),
+		done:           make(chan struct{}),
+	}
+	w.bootstrapObserved.Store(true)
+	w.bootstrapReadyEmptySeen.Store(true)
+	w.outputBuffer.Write("Gemini CLI\nType your message or @path\n› ")
+	w.terminalState.Write("Gemini CLI\nType your message or @path\n› ")
+
+	mgr := &manager{}
+	mgr.checkWorkerIdleTimeout(w)
+	defer w.stopIdleTimer()
+
+	w.idleTimerMu.Lock()
+	idleStartedAt := w.idleStartedAt
+	w.idleTimerMu.Unlock()
+	if idleStartedAt.IsZero() {
+		t.Fatal("expected ready-empty idle start to be recorded")
+	}
+	if idleFor := time.Since(idleStartedAt); idleFor < workerIdleDisplayThreshold {
+		t.Fatalf("expected first idle timeout check to count the elapsed display threshold, got idleFor=%s", idleFor)
+	}
+	if shutdownRequested, _, _ := w.shutdownRequestDetails(); shutdownRequested {
+		t.Fatal("did not expect shutdown on first idle timeout check")
 	}
 }
 
@@ -4149,6 +4476,105 @@ func TestPollPendingReauthSessionStoresRotatedTokensAndClearsAuthRequired(t *tes
 	}
 }
 
+func TestHandleBrowserSyncUserSessionStoresRotatedTokensAndClearsAuthRequired(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	stateFile := filepath.Join(tempHome, "manager-state.json")
+	mgr, err := newManager(config{
+		APIBaseURL:      "http://local.test",
+		SupabaseURL:     "http://supabase.test",
+		SupabaseAnonKey: "anon-key",
+		StateFile:       stateFile,
+		MachineName:     "regression-box",
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	mgr.state.ManagerID = "manager-1"
+	mgr.state.AuthRequired = true
+	mgr.state.ReauthSessionID = "login-123"
+	mgr.state.ReauthCodeVerifier = "verifier-123"
+	if err := writeState(stateFile, mgr.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+	if err := mgr.saveSession(storedSession{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    time.Now().Add(2 * time.Minute).Unix(),
+		UserID:       "user-1",
+	}); err != nil {
+		t.Fatalf("saveSession error: %v", err)
+	}
+
+	freshToken := mustTestJWT(t, jwt.MapClaims{
+		"sub":   "user-1",
+		"email": "user@example.com",
+		"exp":   time.Now().Add(time.Hour).Unix(),
+	})
+	syncCalls := 0
+	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/auth/v1/keys":
+			return jsonHTTPResponse(500, `{"message":"jwks unavailable in test"}`), nil
+		case "/auth/v1/user":
+			if got := r.Header.Get("Authorization"); got != "Bearer "+freshToken {
+				t.Fatalf("unexpected auth header: %q", got)
+			}
+			return jsonHTTPResponse(200, `{"id":"user-1"}`), nil
+		case "/api/managers/manager-1/heartbeat":
+			if got := r.Header.Get("Authorization"); got != "Bearer "+freshToken {
+				t.Fatalf("unexpected heartbeat authorization header: %q", got)
+			}
+			return jsonHTTPResponse(200, `{"ok":true}`), nil
+		case "/local-agent-managers/manager-1/session":
+			if got := r.Header.Get("Authorization"); got != "Bearer "+freshToken {
+				t.Fatalf("unexpected sync authorization header: %q", got)
+			}
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode sync payload: %v", err)
+			}
+			if got := payload["refreshToken"]; got != "browser-refresh" {
+				t.Fatalf("unexpected synced refresh token: %#v", got)
+			}
+			syncCalls++
+			return jsonHTTPResponse(200, `{"ok":true}`), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	expiresAt := time.Now().Add(time.Hour).Unix()
+	if err := mgr.handleBrowserSyncUserSession(context.Background(), freshToken, "browser-refresh", expiresAt, "user-1"); err != nil {
+		t.Fatalf("handleBrowserSyncUserSession error: %v", err)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("expected one manager session sync, got %d", syncCalls)
+	}
+	if mgr.state.AuthRequired {
+		t.Fatal("expected auth_required to be cleared")
+	}
+	if mgr.state.ReauthSessionID != "" || mgr.state.ReauthCodeVerifier != "" {
+		t.Fatalf("expected reauth state to be cleared, got %#v", mgr.state)
+	}
+	session, err := mgr.loadSession()
+	if err != nil {
+		t.Fatalf("loadSession error: %v", err)
+	}
+	if session.AccessToken != freshToken || session.RefreshToken != "browser-refresh" || session.UserID != "user-1" {
+		t.Fatalf("expected browser session to be stored, got %#v", session)
+	}
+	state, err := readState(stateFile)
+	if err != nil {
+		t.Fatalf("readState error: %v", err)
+	}
+	if state.AuthRequired || state.ReauthSessionID != "" || state.ReauthCodeVerifier != "" {
+		t.Fatalf("expected persisted reauth state to be cleared, got %#v", state)
+	}
+}
+
 func TestPollPendingReauthSessionRejectsWrongAccountTokens(t *testing.T) {
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
@@ -6765,11 +7191,14 @@ func TestRequestGracefulWorkerShutdownWritesPersistPrompt(t *testing.T) {
 	if err := mgr.requestGracefulWorkerShutdown(w); err != nil {
 		t.Fatalf("requestGracefulWorkerShutdown error: %v", err)
 	}
-	if got := input.String(); !strings.Contains(got, "write any new progress to TASK_CONTEXT.md") {
-		t.Fatalf("expected shutdown prompt to mention TASK_CONTEXT.md, got %q", got)
+	if got := input.String(); !strings.Contains(got, "task_checkpoints.jsonl") {
+		t.Fatalf("expected shutdown prompt to mention task_checkpoints.jsonl, got %q", got)
 	}
 	if got := input.String(); !strings.Contains(got, "lessons.jsonl") {
 		t.Fatalf("expected shutdown prompt to mention lessons.jsonl, got %q", got)
+	}
+	if got := input.String(); !strings.Contains(got, "Do not ask the user for permission or confirmation") {
+		t.Fatalf("expected shutdown prompt to tell agents not to ask permission, got %q", got)
 	}
 	shutdownRequested, shutdownPrompt, shutdownMode := w.shutdownRequestDetails()
 	if !shutdownRequested {
@@ -6795,8 +7224,8 @@ func TestRequestManagerRestartWorkerShutdownMarksRestartMode(t *testing.T) {
 	if err := mgr.requestManagerRestartWorkerShutdown(w); err != nil {
 		t.Fatalf("requestManagerRestartWorkerShutdown error: %v", err)
 	}
-	if got := input.String(); !strings.Contains(got, "write any new progress to TASK_CONTEXT.md") {
-		t.Fatalf("expected shutdown prompt to mention TASK_CONTEXT.md, got %q", got)
+	if got := input.String(); !strings.Contains(got, "task_checkpoints.jsonl") {
+		t.Fatalf("expected shutdown prompt to mention task_checkpoints.jsonl, got %q", got)
 	}
 	shutdownRequested, shutdownPrompt, shutdownMode := w.shutdownRequestDetails()
 	if !shutdownRequested {
