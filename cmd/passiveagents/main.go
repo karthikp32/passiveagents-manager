@@ -255,6 +255,8 @@ type manager struct {
 	refreshSessionHook       func(context.Context, string) (storedSession, error)
 	lastHeartbeatTunnelReady bool
 	lastHeartbeatLogAt       time.Time
+	reservedTaskIDs          map[string]struct{}
+	idleShutdownReservations map[string]string
 	taskMetadataMu           sync.Mutex
 }
 
@@ -311,8 +313,8 @@ type worker struct {
 	observedCPUCores            float64
 	lastResourceSampleAt        time.Time
 	idleTimer                   *time.Timer
-	idleStartedAt               time.Time // first moment agent entered ready-empty; zero when busy
 	idleTimerMu                 sync.Mutex
+	lastActivityAt              atomic.Int64 // unix nanos of last user input or agent output; 0 = use startedAt
 	done                        chan struct{}
 	tracked                     atomic.Bool
 	livestreamReady             atomic.Bool
@@ -526,6 +528,23 @@ func (w *worker) stopIdleTimer() {
 	if w.idleTimer != nil {
 		w.idleTimer.Stop()
 	}
+}
+
+func (w *worker) markActivityAt(t time.Time) {
+	if w == nil || t.IsZero() {
+		return
+	}
+	w.lastActivityAt.Store(t.UnixNano())
+}
+
+func (w *worker) lastActivityOrStartAt() time.Time {
+	if w == nil {
+		return time.Time{}
+	}
+	if lastNano := w.lastActivityAt.Load(); lastNano > 0 {
+		return time.Unix(0, lastNano)
+	}
+	return w.startedAt
 }
 
 func (w *worker) markCommandDelivered(commandID string) {
@@ -1198,13 +1217,15 @@ func newManager(cfg config) (*manager, error) {
 				return slog.LevelInfo
 			}()}),
 		),
-		pollNow:               make(chan struct{}, 1),
-		workers:               map[string]*worker{},
-		browserClients:        map[*browserClient]struct{}{},
-		instanceSpawnLocks:    map[string]*sync.Mutex{},
-		browserPreferredSizes: map[string]terminalSize{},
-		managerSubdomain:      state.ManagerSubdomain,
-		tunnelToken:           state.TunnelToken,
+		pollNow:                  make(chan struct{}, 1),
+		workers:                  map[string]*worker{},
+		browserClients:           map[*browserClient]struct{}{},
+		instanceSpawnLocks:       map[string]*sync.Mutex{},
+		browserPreferredSizes:    map[string]terminalSize{},
+		reservedTaskIDs:          map[string]struct{}{},
+		idleShutdownReservations: map[string]string{},
+		managerSubdomain:         state.ManagerSubdomain,
+		tunnelToken:              state.TunnelToken,
 	}, nil
 }
 
@@ -1350,8 +1371,8 @@ func (m *manager) login(ctx context.Context) error {
 
 	fmt.Printf("? Press Enter to open %s in your browser... ", strings.TrimSuffix(m.cfg.WebBaseURL, "/"))
 	_, _ = bufio.NewReader(os.Stdin).ReadBytes('\n')
-	if shouldAttemptBrowserOpen() {
-		if err := tryOpenBrowser(loginURL); err != nil {
+	if shouldAttemptBrowserOpenFunc() {
+		if err := tryOpenBrowserFunc(loginURL); err != nil {
 			fmt.Println("Please open this URL in your browser:")
 			fmt.Printf("%s\n", loginURL)
 		}
@@ -1401,17 +1422,26 @@ func (m *manager) login(ctx context.Context) error {
 				continue
 			}
 
-			// Extract email directly from the JWT claims (avoids storing it in DB).
-			userEmail := ""
-			if claims, err := m.validateSupabaseJWT(pollResp.AccessToken); err == nil {
-				userEmail = claimString(claims, "email")
+			accessToken := strings.TrimSpace(pollResp.AccessToken)
+			refreshToken := strings.TrimSpace(pollResp.RefreshToken)
+			userID := strings.TrimSpace(pollResp.UserID)
+			if accessToken == "" || refreshToken == "" || pollResp.ExpiresAt <= 0 || userID == "" {
+				return fmt.Errorf("login session completed with invalid tokens")
+			}
+			claims, err := m.validateSupabaseJWT(accessToken)
+			if err != nil {
+				return fmt.Errorf("login session completed with invalid access token: %w", err)
+			}
+			tokenUserID := strings.TrimSpace(claimString(claims, "sub"))
+			if tokenUserID == "" || tokenUserID != userID {
+				return fmt.Errorf("login session user mismatch")
 			}
 			session := storedSession{
-				AccessToken:  pollResp.AccessToken,
-				RefreshToken: pollResp.RefreshToken,
+				AccessToken:  accessToken,
+				RefreshToken: refreshToken,
 				ExpiresAt:    pollResp.ExpiresAt,
-				UserID:       pollResp.UserID,
-				UserEmail:    userEmail,
+				UserID:       userID,
+				UserEmail:    claimString(claims, "email"),
 			}
 
 			if err := m.saveSession(session); err != nil {
@@ -2409,7 +2439,10 @@ func (m *manager) applyBrowserTerminalInput(instanceID, data string) {
 	}
 	if _, err := io.WriteString(worker.input, data); err != nil {
 		m.logError("browser_terminal_input_error instance_id=%s err=%v", instanceID, err)
+		return
 	}
+	worker.markActivityAt(time.Now())
+	worker.resetIdleTimer()
 }
 
 func workerTerminalVisibleToBrowser(w *worker) bool {
@@ -2930,6 +2963,7 @@ func (m *manager) requestWorkerShutdown(w *worker, mode, routedMessage string, g
 		}
 		if err := m.killWorkerWithRetry(w); err != nil {
 			w.clearShutdownRequested()
+			m.clearIdleShutdownReservation(w.instanceID)
 			livestreamState := m.computeLivestreamState(w.instanceID)
 			agentState, message := m.computeAgentState(w.instanceID)
 			m.broadcastBothStates(w.instanceID, livestreamState, agentState, message)
@@ -3192,27 +3226,33 @@ func (m *manager) computeAgentState(instanceID string) (state, message string) {
 	if reason, ok := deferredBootstrapReasonForWorker(worker); ok {
 		return "working", reason
 	}
-	// User has taken over (livestream ready) — show current output and return working state
-	status := workerPromptStatusForWorker(worker)
-	if status.State == workerPromptStateReadyEmpty {
-		status2 := workerAgentStatusForWorker(worker)
-		if status2 == "" {
-			status2 = "working"
+	if !worker.bootstrapObserved.Load() {
+		promptStatus := workerPromptStatusForWorker(worker)
+		if promptStatus.State == workerPromptStateReadyWithDraft && strings.TrimSpace(promptStatus.Snapshot) != "" {
+			return "working", promptStatus.Snapshot
 		}
-		return status2, ""
-	}
-	if strings.TrimSpace(status.Snapshot) != "" {
-		return "working", status.Snapshot
-	}
-	// No snapshot available, fall back to agent status
-	status2 := workerAgentStatusForWorker(worker)
-	if status2 == "" {
-		status2 = "working"
-	}
-	if status2 == "waking_up" {
 		return "waking_up", startupWakingMessageForWorker(worker)
 	}
-	return status2, ""
+	status := workerAgentStatusForWorker(worker)
+	if status == "idle" {
+		return "idle", ""
+	}
+	if status == "" {
+		status = "working"
+	}
+	if status == "waking_up" {
+		return "waking_up", startupWakingMessageForWorker(worker)
+	}
+
+	// User has taken over (livestream ready) — show current output while working.
+	promptStatus := workerPromptStatusForWorker(worker)
+	if promptStatus.State == workerPromptStateReadyEmpty {
+		return "working", ""
+	}
+	if strings.TrimSpace(promptStatus.Snapshot) != "" {
+		return "working", promptStatus.Snapshot
+	}
+	return "working", ""
 }
 
 func startupWakingMessageForWorker(w *worker) string {
@@ -3230,36 +3270,24 @@ func workerAgentStatusForWorker(w *worker) string {
 		return "working"
 	}
 	if !w.bootstrapObserved.Load() {
-		w.idleTimerMu.Lock()
-		w.idleStartedAt = time.Time{}
-		w.idleTimerMu.Unlock()
 		return "waking_up"
 	}
-	status := workerPromptStatusForWorker(w)
-	if status.State == workerPromptStateReadyEmpty {
-		w.bootstrapReadyEmptySeen.Store(true)
-		w.idleTimerMu.Lock()
-		if w.idleStartedAt.IsZero() {
-			w.idleStartedAt = time.Now()
-		}
-		idleFor := time.Since(w.idleStartedAt)
-		w.idleTimerMu.Unlock()
-		if idleFor >= workerIdleDisplayThreshold {
-			return "idle"
-		}
-		return "working"
-	}
-	// Agent is busy — clear idle start so the clock resets next time it goes idle.
-	w.idleTimerMu.Lock()
-	w.idleStartedAt = time.Time{}
-	w.idleTimerMu.Unlock()
 	if !w.bootstrapReadyEmptySeen.Load() {
-		if observedAt := w.bootstrapObservedAt.Load(); observedAt > 0 {
-			if time.Since(time.Unix(0, observedAt)) >= postBootstrapWorkingGrace {
-				return "working"
+		status := workerPromptStatusForWorker(w)
+		if status.State == workerPromptStateReadyEmpty {
+			w.bootstrapReadyEmptySeen.Store(true)
+		} else {
+			if observedAt := w.bootstrapObservedAt.Load(); observedAt > 0 {
+				if time.Since(time.Unix(0, observedAt)) >= postBootstrapWorkingGrace {
+					return "working"
+				}
 			}
+			return "waking_up"
 		}
-		return "waking_up"
+	}
+	lastActivityAt := w.lastActivityOrStartAt()
+	if !lastActivityAt.IsZero() && time.Since(lastActivityAt) >= workerIdleDisplayThreshold {
+		return "idle"
 	}
 	return "working"
 }
@@ -4605,6 +4633,8 @@ func (m *manager) spawnWorkerWithWorkingDir(
 	preferredInstanceID string,
 	workingDirOverride string,
 ) (err error) {
+	defer m.clearReservedTaskID(task.ID)
+
 	workingDir := strings.TrimSpace(workingDirOverride)
 	if workingDir == "" {
 		workingDir, err = m.resolveTaskWorkingDir(ctx, task)
@@ -5480,6 +5510,7 @@ func (m *manager) startWorkerProcess(
 		deliveredCommandIDs:     make(map[string]struct{}),
 		done:                    make(chan struct{}),
 	}
+	w.markActivityAt(w.startedAt)
 	if w.terminalReplayBuffer != nil {
 		w.terminalReplayEventSeq++
 		w.terminalReplayBuffer.AppendResize(w.terminalReplayEventSeq, width, height)
@@ -5894,6 +5925,8 @@ func (m *manager) readOutputLoop(ctx context.Context, w *worker) {
 			_ = appendRawLocalLogChunk(w.localLogFilePath, chunkBytes)
 			m.broadcastAttachOutput(w, chunkBytes)
 			w.outputBuffer.Write(chunk)
+			w.markActivityAt(time.Now())
+			w.resetIdleTimer()
 			m.captureAssistantFragment(w, chunk)
 			m.persistWorkerActivityStatus(w)
 			m.broadcastBrowserTerminalOutput(w.instanceID, sequence, chunkBytes)
@@ -5955,7 +5988,21 @@ func (m *manager) handleAttachClientInput(w *worker, conn net.Conn) {
 		return
 	}
 
-	_, _ = io.Copy(w.input, reader)
+	_, _ = io.Copy(workerActivityWriter{worker: w, dst: w.input}, reader)
+}
+
+type workerActivityWriter struct {
+	worker *worker
+	dst    io.Writer
+}
+
+func (w workerActivityWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	if n > 0 && w.worker != nil {
+		w.worker.markActivityAt(time.Now())
+		w.worker.resetIdleTimer()
+	}
+	return n, err
 }
 
 func applyAttachSizeHandshakeForPTY(conn net.Conn, bufferedConn *bufio.Reader, applySize func(cols, rows int)) bool {
@@ -6640,6 +6687,7 @@ func (m *manager) writeAgentInputWithOptions(w *worker, line string, logAsUser, 
 			return err
 		}
 	}
+	w.markActivityAt(time.Now())
 	w.resetIdleTimer()
 	if logAsUser {
 		w.logs <- logEntry{
@@ -7366,6 +7414,7 @@ func (m *manager) monitorWorkerExit(w *worker) {
 		delete(m.workers, w.instanceID)
 		delete(m.state.Instances, w.instanceID)
 		delete(m.instanceSpawnLocks, w.instanceID)
+		m.clearIdleShutdownReservationLocked(w.instanceID)
 		_ = writeState(m.cfg.StateFile, m.state)
 		m.mu.Unlock()
 
@@ -7385,6 +7434,7 @@ func (m *manager) monitorWorkerExit(w *worker) {
 			m.mu.Lock()
 			delete(m.workers, w.instanceID)
 			delete(m.instanceSpawnLocks, w.instanceID)
+			m.clearIdleShutdownReservationLocked(w.instanceID)
 			persisted := m.state.Instances[w.instanceID]
 			persisted.PID = 0
 			if strings.TrimSpace(persisted.TaskID) == "" {
@@ -7431,6 +7481,7 @@ func (m *manager) monitorWorkerExit(w *worker) {
 		delete(m.workers, w.instanceID)
 		delete(m.state.Instances, w.instanceID)
 		delete(m.instanceSpawnLocks, w.instanceID)
+		m.clearIdleShutdownReservationLocked(w.instanceID)
 		_ = writeState(m.cfg.StateFile, m.state)
 		m.mu.Unlock()
 
@@ -7454,6 +7505,7 @@ func (m *manager) monitorWorkerExit(w *worker) {
 	delete(m.workers, w.instanceID)
 	delete(m.state.Instances, w.instanceID)
 	delete(m.instanceSpawnLocks, w.instanceID)
+	m.clearIdleShutdownReservationLocked(w.instanceID)
 	_ = writeState(m.cfg.StateFile, m.state)
 	m.mu.Unlock()
 
@@ -7476,34 +7528,178 @@ func (m *manager) checkWorkerIdleTimeout(w *worker) {
 		return
 	default:
 	}
-	w.idleTimerMu.Lock()
-	wasIdleStartUnknown := w.idleStartedAt.IsZero()
-	w.idleTimerMu.Unlock()
 
-	// Call workerAgentStatusForWorker to ensure idleStartedAt is updated even
-	// when no browser clients are connected to trigger broadcastAgentState.
-	_ = workerAgentStatusForWorker(w)
+	// Broadcast current status so the frontend reflects IDLE without needing
+	// fresh agent output to trigger readOutputLoop.
+	m.persistWorkerActivityStatus(w)
 
-	w.idleTimerMu.Lock()
-	idleStarted := w.idleStartedAt
-	if wasIdleStartUnknown && !idleStarted.IsZero() {
-		idleStarted = idleStarted.Add(-workerIdleDisplayThreshold)
-		w.idleStartedAt = idleStarted
-	}
-	w.idleTimerMu.Unlock()
-
-	if idleStarted.IsZero() || time.Since(idleStarted) < workerIdleShutdownThreshold {
-		// Not yet idle, or hasn't been idle long enough — check again later.
+	lastActivityAt := w.lastActivityOrStartAt()
+	if lastActivityAt.IsZero() || time.Since(lastActivityAt) < workerIdleShutdownThreshold {
+		// User input or agent output is recent or unknown — check again later.
 		w.resetIdleTimer()
 		return
 	}
 	if requested, _, _ := w.shutdownRequestDetails(); requested {
 		return
 	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	shouldShutdown, err := m.shouldShutdownIdleWorkerForReadyTask(shutdownCtx, w)
+	if err != nil {
+		m.logWarn("worker_idle_timeout_ready_task_check_error instance_id=%s err=%v", w.instanceID, err)
+		w.resetIdleTimer()
+		return
+	}
+	if !shouldShutdown {
+		m.logInfo("worker_idle_timeout_deferred instance_id=%s reason=no_ready_task_capacity_pressure", w.instanceID)
+		w.resetIdleTimer()
+		return
+	}
+	if currentActivityAt := w.lastActivityOrStartAt(); !currentActivityAt.Equal(lastActivityAt) {
+		m.logInfo("worker_idle_timeout_deferred instance_id=%s reason=activity_during_ready_task_check", w.instanceID)
+		m.clearIdleShutdownReservation(w.instanceID)
+		w.resetIdleTimer()
+		return
+	}
 	m.logInfo("worker_idle_timeout instance_id=%s", w.instanceID)
 	if err := m.requestIdleTimeoutShutdown(w); err != nil {
 		m.logWarn("worker_idle_timeout_shutdown_error instance_id=%s err=%v", w.instanceID, err)
+		m.clearIdleShutdownReservation(w.instanceID)
 	}
+}
+
+func (m *manager) shouldShutdownIdleWorkerForReadyTask(ctx context.Context, w *worker) (bool, error) {
+	if w == nil {
+		return false, nil
+	}
+	capacity := m.currentCapacitySnapshot()
+	if capacity.CurrentRunningAgents < capacity.MaxParallelAgents {
+		return false, nil
+	}
+
+	personas, tasks, err := m.fetchEligibleReadyWork(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(personas) == 0 || len(tasks) == 0 {
+		return false, nil
+	}
+
+	for _, task := range tasks {
+		taskID := strings.TrimSpace(task.ID)
+		if taskID == "" {
+			continue
+		}
+		persona := choosePersonaForTask(personas, task)
+		if persona == nil || strings.TrimSpace(persona.RuntimeID) == "" {
+			continue
+		}
+		if m.reserveTaskForIdleShutdown(w.instanceID, taskID) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *manager) reserveTaskForIdleShutdown(instanceID, taskID string) bool {
+	instanceID = strings.TrimSpace(instanceID)
+	taskID = strings.TrimSpace(taskID)
+	if instanceID == "" || taskID == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, worker := range m.workers {
+		if worker == nil {
+			continue
+		}
+		if strings.TrimSpace(worker.taskID) == taskID {
+			return false
+		}
+	}
+	if m.reservedTaskIDs == nil {
+		m.reservedTaskIDs = map[string]struct{}{}
+	}
+	if m.idleShutdownReservations == nil {
+		m.idleShutdownReservations = map[string]string{}
+	}
+	if _, exists := m.reservedTaskIDs[taskID]; exists {
+		return false
+	}
+	m.reservedTaskIDs[taskID] = struct{}{}
+	m.idleShutdownReservations[instanceID] = taskID
+	return true
+}
+
+func (m *manager) clearReservedTaskID(taskID string) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return
+	}
+	m.mu.Lock()
+	m.clearReservedTaskIDLocked(taskID)
+	m.mu.Unlock()
+}
+
+func (m *manager) clearReservedTaskIDLocked(taskID string) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return
+	}
+	delete(m.reservedTaskIDs, taskID)
+	for instanceID, reservedTaskID := range m.idleShutdownReservations {
+		if strings.TrimSpace(reservedTaskID) == taskID {
+			delete(m.idleShutdownReservations, instanceID)
+		}
+	}
+}
+
+func (m *manager) clearIdleShutdownReservation(instanceID string) {
+	instanceID = strings.TrimSpace(instanceID)
+	if instanceID == "" {
+		return
+	}
+	m.mu.Lock()
+	m.clearIdleShutdownReservationLocked(instanceID)
+	m.mu.Unlock()
+}
+
+func (m *manager) clearIdleShutdownReservationLocked(instanceID string) {
+	instanceID = strings.TrimSpace(instanceID)
+	if instanceID == "" {
+		return
+	}
+	taskID := strings.TrimSpace(m.idleShutdownReservations[instanceID])
+	delete(m.idleShutdownReservations, instanceID)
+	if taskID != "" {
+		delete(m.reservedTaskIDs, taskID)
+	}
+}
+
+func (m *manager) fetchEligibleReadyWork(ctx context.Context) ([]apiAgentPersona, []apiTask, error) {
+	var personas []apiAgentPersona
+	if err := m.managerRequestJSON(ctx, http.MethodGet, "/managers/tasks/agent-personas", nil, &personas); err != nil {
+		return nil, nil, err
+	}
+	if len(personas) == 0 {
+		return nil, nil, nil
+	}
+
+	agentIDs := make([]string, 0, len(personas))
+	for _, persona := range personas {
+		if id := strings.TrimSpace(persona.ID); id != "" {
+			agentIDs = append(agentIDs, id)
+		}
+	}
+	if len(agentIDs) == 0 {
+		return personas, nil, nil
+	}
+
+	var tasks []apiTask
+	if err := m.managerRequestJSON(ctx, http.MethodPost, "/managers/tasks/eligible", map[string]any{"agentIds": agentIDs}, &tasks); err != nil {
+		return nil, nil, err
+	}
+	return personas, tasks, nil
 }
 
 func (m *manager) instanceHeartbeatLoop(ctx context.Context) {
@@ -7537,9 +7733,11 @@ func (m *manager) sendInstanceHeartbeats(ctx context.Context) {
 		); err != nil {
 			m.logError("instance_heartbeat_error instance_id=%s err=%v", instanceID, err)
 
-			// If the backend actively rejected the heartbeat (400 or 403), it means lock loss.
-			// Terminate the local process to prevent duplicate work.
-			if strings.Contains(err.Error(), "status=400") || strings.Contains(err.Error(), "status=403") {
+			// 400/403 = lock loss; 404 = instance unknown to backend.
+			// In all cases the local process has no valid backend registration — terminate it.
+			if strings.Contains(err.Error(), "status=400") ||
+				strings.Contains(err.Error(), "status=403") ||
+				strings.Contains(err.Error(), "status=404") {
 				m.logError("lock_lost_terminating_worker instance_id=%s", instanceID)
 				m.mu.Lock()
 				w, ok := m.workers[instanceID]
@@ -8057,6 +8255,14 @@ func (m *manager) pollPendingReauthSession(ctx context.Context) error {
 	if accessToken == "" || refreshToken == "" || pollResp.ExpiresAt <= 0 || userID == "" {
 		return fmt.Errorf("reauth session completed with invalid tokens")
 	}
+	claims, err := m.validateSupabaseJWT(accessToken)
+	if err != nil {
+		return fmt.Errorf("reauth session completed with invalid access token: %w", err)
+	}
+	tokenUserID := strings.TrimSpace(claimString(claims, "sub"))
+	if tokenUserID == "" || tokenUserID != userID {
+		return fmt.Errorf("reauth session user mismatch")
+	}
 	managerUserID, err := m.currentManagerUserID(ctx)
 	if err != nil {
 		return err
@@ -8070,16 +8276,12 @@ func (m *manager) pollPendingReauthSession(ctx context.Context) error {
 		)
 		return fmt.Errorf("reauth session does not match the manager account")
 	}
-	userEmail := ""
-	if claims, err := m.validateSupabaseJWT(accessToken); err == nil {
-		userEmail = claimString(claims, "email")
-	}
 	session := storedSession{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
 		ExpiresAt:    pollResp.ExpiresAt,
 		UserID:       userID,
-		UserEmail:    userEmail,
+		UserEmail:    claimString(claims, "email"),
 	}
 	if err := m.saveSession(session); err != nil {
 		return err
@@ -9090,7 +9292,6 @@ func (m *manager) persistWorkerActivityStatus(w *worker) {
 	}
 	m.state.Instances[w.instanceID] = persisted
 	_ = writeState(m.cfg.StateFile, m.state)
-	w.resetIdleTimer()
 	m.mu.Unlock()
 	m.broadcastAgentState(w.instanceID, status, "")
 	m.mu.Lock()
@@ -10299,6 +10500,11 @@ func tryOpenBrowser(targetURL string) error {
 	cmd.Stderr = io.Discard
 	return cmd.Run()
 }
+
+var (
+	tryOpenBrowserFunc           = tryOpenBrowser
+	shouldAttemptBrowserOpenFunc = shouldAttemptBrowserOpen
+)
 
 func shouldAttemptBrowserOpen() bool {
 	if runtime.GOOS != "linux" {

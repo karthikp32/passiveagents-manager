@@ -1133,6 +1133,80 @@ func TestRequestWorkerShutdownRetriesKillWithBackoff(t *testing.T) {
 	}
 }
 
+func TestIdleShutdownRollbackClearsReadyTaskReservation(t *testing.T) {
+	oldKill := killManagedPIDFunc
+	oldBaseDelay := shutdownKillRetryBaseDelay
+	oldMaxDelay := shutdownKillRetryMaxDelay
+	t.Cleanup(func() {
+		killManagedPIDFunc = oldKill
+		shutdownKillRetryBaseDelay = oldBaseDelay
+		shutdownKillRetryMaxDelay = oldMaxDelay
+	})
+
+	shutdownKillRetryBaseDelay = time.Millisecond
+	shutdownKillRetryMaxDelay = time.Millisecond
+
+	cmd := exec.Command("sh", "-lc", "sleep 30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep process: %v", err)
+	}
+	pid := cmd.Process.Pid
+	t.Cleanup(func() {
+		if isProcessRunning(pid) {
+			_ = killManagedPID(pid)
+		}
+		_, _ = cmd.Process.Wait()
+	})
+
+	killManagedPIDFunc = func(targetPID int) error {
+		if targetPID != pid {
+			return fmt.Errorf("unexpected pid %d", targetPID)
+		}
+		return fmt.Errorf("kill failed")
+	}
+
+	w := &worker{
+		instanceID:     "instance-1",
+		usesPTY:        true,
+		runtimeCommand: "gemini --model auto",
+		cmd:            cmd,
+		input:          nopWriteCloser{Writer: &bytes.Buffer{}},
+		outputBuffer:   &outputRingBuffer{maxSize: 4096},
+		terminalState:  newVTScreenState(80, 24),
+		done:           make(chan struct{}),
+		logs:           make(chan logEntry, 1),
+	}
+	setWorkerPromptSnapshotForTest(w, "Gemini CLI\n› shutting down")
+
+	mgr := &manager{
+		logger:                   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		workers:                  map[string]*worker{"instance-1": w},
+		reservedTaskIDs:          map[string]struct{}{"ready-task": {}},
+		idleShutdownReservations: map[string]string{"instance-1": "ready-task"},
+	}
+
+	if err := mgr.requestWorkerShutdown(w, shutdownModeIdleTimeout, "Shutdown requested.", time.Millisecond); err != nil {
+		t.Fatalf("requestWorkerShutdown error: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		requested, _, _ := w.shutdownRequestDetails()
+		mgr.mu.Lock()
+		_, reserved := mgr.reservedTaskIDs["ready-task"]
+		_, mapped := mgr.idleShutdownReservations["instance-1"]
+		mgr.mu.Unlock()
+		if !requested && !reserved && !mapped {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	requested, _, _ := w.shutdownRequestDetails()
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	t.Fatalf("expected rollback to clear shutdown and reservation, requested=%t reserved=%v mapped=%v", requested, mgr.reservedTaskIDs, mgr.idleShutdownReservations)
+}
+
 func TestStartPTYProcessRetriesWithoutSetcttyWhenNativePTYNotPermitted(t *testing.T) {
 	oldStartWithSize := ptyStartWithSize
 	oldOpen := ptyOpen
@@ -1270,57 +1344,312 @@ func TestWorkerAgentStatusReturnsWorkingForBusyPromptAfterInitialReadyEmpty(t *t
 	}
 }
 
-func TestComputeAgentStateReturnsIdleForReadyEmptyAfterDisplayThreshold(t *testing.T) {
+func TestComputeAgentStateReturnsIdleAfterNoActivitySinceStart(t *testing.T) {
 	w := &worker{
 		instanceID:     "instance-1",
 		usesPTY:        true,
 		runtimeCommand: "gemini --model auto",
 		outputBuffer:   &outputRingBuffer{maxSize: 4096},
 		terminalState:  newVTScreenState(80, 24),
+		startedAt:      time.Now().Add(-workerIdleDisplayThreshold - time.Second),
 	}
 	w.livestreamReady.Store(true)
 	w.bootstrapObserved.Store(true)
 	w.bootstrapReadyEmptySeen.Store(true)
-	w.outputBuffer.Write("Gemini CLI\nType your message or @path\n› ")
-	w.terminalState.Write("Gemini CLI\nType your message or @path\n› ")
-	w.idleStartedAt = time.Now().Add(-workerIdleDisplayThreshold - time.Second)
+	w.outputBuffer.Write("Gemini CLI\nWorking...\n")
+	w.terminalState.Write("Gemini CLI\nWorking...\n")
 
 	mgr := &manager{workers: map[string]*worker{"instance-1": w}}
 	state, _ := mgr.computeAgentState("instance-1")
 	if state != "idle" {
-		t.Fatalf("expected ready-empty worker to be idle after display threshold, got %q", state)
+		t.Fatalf("expected worker with no activity since start to be idle after display threshold, got %q", state)
 	}
 }
 
-func TestCheckWorkerIdleTimeoutBackdatesFirstReadyEmptyObservation(t *testing.T) {
+func TestComputeAgentStateReturnsWorkingForRecentActivity(t *testing.T) {
 	w := &worker{
 		instanceID:     "instance-1",
 		usesPTY:        true,
 		runtimeCommand: "gemini --model auto",
 		outputBuffer:   &outputRingBuffer{maxSize: 4096},
 		terminalState:  newVTScreenState(80, 24),
+		startedAt:      time.Now().Add(-workerIdleDisplayThreshold - time.Second),
+	}
+	w.livestreamReady.Store(true)
+	w.bootstrapObserved.Store(true)
+	w.bootstrapReadyEmptySeen.Store(true)
+	w.markActivityAt(time.Now())
+	w.outputBuffer.Write("Gemini CLI\nWorking...\n")
+	w.terminalState.Write("Gemini CLI\nWorking...\n")
+
+	mgr := &manager{workers: map[string]*worker{"instance-1": w}}
+	state, _ := mgr.computeAgentState("instance-1")
+	if state != "working" {
+		t.Fatalf("expected recent activity to keep worker working, got %q", state)
+	}
+}
+
+func TestCheckWorkerIdleTimeoutDoesNotShutdownWhenCapacityAvailable(t *testing.T) {
+	w := &worker{
+		instanceID:     "instance-1",
+		usesPTY:        false,
+		runtimeCommand: "gemini --model auto",
+		input:          nopWriteCloser{Writer: io.Discard},
+		outputBuffer:   &outputRingBuffer{maxSize: 4096},
+		terminalState:  newVTScreenState(80, 24),
 		done:           make(chan struct{}),
+		startedAt:      time.Now().Add(-workerIdleShutdownThreshold - time.Second),
 	}
 	w.bootstrapObserved.Store(true)
 	w.bootstrapReadyEmptySeen.Store(true)
 	w.outputBuffer.Write("Gemini CLI\nType your message or @path\n› ")
 	w.terminalState.Write("Gemini CLI\nType your message or @path\n› ")
 
-	mgr := &manager{}
+	mgr := &manager{
+		cfg:     config{MaxConcurrent: 2, MBPerAgent: 1024},
+		workers: map[string]*worker{},
+		freeMB:  4096,
+		totalMB: 8192,
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			t.Fatalf("did not expect READY task lookup while capacity is available: %s %s", r.Method, r.URL.Path)
+			return nil, nil
+		})},
+	}
 	mgr.checkWorkerIdleTimeout(w)
-	defer w.stopIdleTimer()
 
-	w.idleTimerMu.Lock()
-	idleStartedAt := w.idleStartedAt
-	w.idleTimerMu.Unlock()
-	if idleStartedAt.IsZero() {
-		t.Fatal("expected ready-empty idle start to be recorded")
+	if shutdownRequested, _, shutdownMode := w.shutdownRequestDetails(); shutdownRequested {
+		t.Fatalf("did not expect idle timeout shutdown without capacity pressure, mode=%q", shutdownMode)
 	}
-	if idleFor := time.Since(idleStartedAt); idleFor < workerIdleDisplayThreshold {
-		t.Fatalf("expected first idle timeout check to count the elapsed display threshold, got idleFor=%s", idleFor)
+}
+
+func TestCheckWorkerIdleTimeoutDoesNotShutdownWhenNoReadyTaskNeedsCapacity(t *testing.T) {
+	w := &worker{
+		instanceID:     "instance-1",
+		taskID:         "running-task",
+		agentID:        "agent-1",
+		usesPTY:        false,
+		runtimeCommand: "gemini --model auto",
+		input:          nopWriteCloser{Writer: io.Discard},
+		outputBuffer:   &outputRingBuffer{maxSize: 4096},
+		terminalState:  newVTScreenState(80, 24),
+		done:           make(chan struct{}),
+		startedAt:      time.Now().Add(-workerIdleShutdownThreshold - time.Second),
 	}
-	if shutdownRequested, _, _ := w.shutdownRequestDetails(); shutdownRequested {
-		t.Fatal("did not expect shutdown on first idle timeout check")
+	w.bootstrapObserved.Store(true)
+	w.bootstrapReadyEmptySeen.Store(true)
+
+	mgr := &manager{
+		cfg:     config{UserJWT: "user-jwt", MaxConcurrent: 1, MBPerAgent: 1024},
+		workers: map[string]*worker{"instance-1": w},
+		state:   persistedState{ManagerID: "manager-1", Instances: map[string]persistedWorker{"instance-1": {Status: "idle"}}},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/managers/tasks/agent-personas":
+				return jsonHTTPResponse(200, `[{"id":"agent-1","name":"Agent","runtime_id":"runtime-1"}]`), nil
+			case r.Method == http.MethodPost && r.URL.Path == "/managers/tasks/eligible":
+				return jsonHTTPResponse(200, `[]`), nil
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+				return nil, nil
+			}
+		})},
+	}
+	mgr.checkWorkerIdleTimeout(w)
+
+	if shutdownRequested, _, shutdownMode := w.shutdownRequestDetails(); shutdownRequested {
+		t.Fatalf("did not expect idle timeout shutdown without READY work, mode=%q", shutdownMode)
+	}
+}
+
+func TestCheckWorkerIdleTimeoutRequestsShutdownWhenReadyTaskNeedsCapacity(t *testing.T) {
+	w := &worker{
+		instanceID:     "instance-1",
+		taskID:         "running-task",
+		agentID:        "agent-1",
+		usesPTY:        false,
+		runtimeCommand: "gemini --model auto",
+		input:          nopWriteCloser{Writer: io.Discard},
+		outputBuffer:   &outputRingBuffer{maxSize: 4096},
+		terminalState:  newVTScreenState(80, 24),
+		done:           make(chan struct{}),
+		startedAt:      time.Now().Add(-workerIdleShutdownThreshold - time.Second),
+	}
+	w.bootstrapObserved.Store(true)
+	w.bootstrapReadyEmptySeen.Store(true)
+
+	mgr := &manager{
+		cfg:     config{UserJWT: "user-jwt", MaxConcurrent: 1, MBPerAgent: 1024},
+		workers: map[string]*worker{"instance-1": w},
+		state:   persistedState{ManagerID: "manager-1", Instances: map[string]persistedWorker{"instance-1": {Status: "idle"}}},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/managers/tasks/agent-personas":
+				return jsonHTTPResponse(200, `[{"id":"agent-1","name":"Agent","runtime_id":"runtime-1"}]`), nil
+			case r.Method == http.MethodPost && r.URL.Path == "/managers/tasks/eligible":
+				return jsonHTTPResponse(200, `[{"id":"ready-task","name":"Ready task","status":"READY","eligible_agent_ids":["agent-1"]}]`), nil
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+				return nil, nil
+			}
+		})},
+	}
+	mgr.checkWorkerIdleTimeout(w)
+
+	if shutdownRequested, _, shutdownMode := w.shutdownRequestDetails(); !shutdownRequested || shutdownMode != shutdownModeIdleTimeout {
+		t.Fatalf("expected idle timeout shutdown when READY work needs capacity, requested=%t mode=%q", shutdownRequested, shutdownMode)
+	}
+}
+
+func TestCheckWorkerIdleTimeoutDefersShutdownWhenActivityChangesDuringReadyCheck(t *testing.T) {
+	w := &worker{
+		instanceID:     "instance-1",
+		taskID:         "running-task",
+		agentID:        "agent-1",
+		usesPTY:        false,
+		runtimeCommand: "gemini --model auto",
+		input:          nopWriteCloser{Writer: io.Discard},
+		outputBuffer:   &outputRingBuffer{maxSize: 4096},
+		terminalState:  newVTScreenState(80, 24),
+		done:           make(chan struct{}),
+		startedAt:      time.Now().Add(-workerIdleShutdownThreshold - time.Second),
+	}
+	w.bootstrapObserved.Store(true)
+	w.bootstrapReadyEmptySeen.Store(true)
+
+	mgr := &manager{
+		cfg:     config{UserJWT: "user-jwt", MaxConcurrent: 1, MBPerAgent: 1024},
+		workers: map[string]*worker{"instance-1": w},
+		state:   persistedState{ManagerID: "manager-1", Instances: map[string]persistedWorker{"instance-1": {Status: "idle"}}},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/managers/tasks/agent-personas":
+				return jsonHTTPResponse(200, `[{"id":"agent-1","name":"Agent","runtime_id":"runtime-1"}]`), nil
+			case r.Method == http.MethodPost && r.URL.Path == "/managers/tasks/eligible":
+				w.markActivityAt(time.Now())
+				return jsonHTTPResponse(200, `[{"id":"ready-task","name":"Ready task","status":"READY","eligible_agent_ids":["agent-1"]}]`), nil
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+				return nil, nil
+			}
+		})},
+	}
+	mgr.checkWorkerIdleTimeout(w)
+
+	if shutdownRequested, _, shutdownMode := w.shutdownRequestDetails(); shutdownRequested {
+		t.Fatalf("did not expect idle timeout shutdown after fresh activity, mode=%q", shutdownMode)
+	}
+	mgr.mu.Lock()
+	_, reserved := mgr.reservedTaskIDs["ready-task"]
+	_, mapped := mgr.idleShutdownReservations["instance-1"]
+	mgr.mu.Unlock()
+	if reserved || mapped {
+		t.Fatalf("expected deferred shutdown to clear reservation, reserved=%v mapped=%v", reserved, mapped)
+	}
+}
+
+func TestShouldShutdownIdleWorkerReservesReadyTaskOnce(t *testing.T) {
+	w1 := &worker{
+		instanceID: "instance-1",
+		taskID:     "running-task-1",
+		done:       make(chan struct{}),
+	}
+	w2 := &worker{
+		instanceID: "instance-2",
+		taskID:     "running-task-2",
+		done:       make(chan struct{}),
+	}
+
+	mgr := &manager{
+		cfg:             config{UserJWT: "user-jwt", MaxConcurrent: 2, MBPerAgent: 1024},
+		workers:         map[string]*worker{"instance-1": w1, "instance-2": w2},
+		reservedTaskIDs: map[string]struct{}{},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/managers/tasks/agent-personas":
+				return jsonHTTPResponse(200, `[{"id":"agent-1","name":"Agent","runtime_id":"runtime-1"}]`), nil
+			case r.Method == http.MethodPost && r.URL.Path == "/managers/tasks/eligible":
+				return jsonHTTPResponse(200, `[{"id":"ready-task","name":"Ready task","status":"READY","eligible_agent_ids":["agent-1"]}]`), nil
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+				return nil, nil
+			}
+		})},
+	}
+
+	first, err := mgr.shouldShutdownIdleWorkerForReadyTask(context.Background(), w1)
+	if err != nil {
+		t.Fatalf("shouldShutdownIdleWorkerForReadyTask first error: %v", err)
+	}
+	if !first {
+		t.Fatal("expected first idle worker to reserve READY task capacity")
+	}
+	second, err := mgr.shouldShutdownIdleWorkerForReadyTask(context.Background(), w2)
+	if err != nil {
+		t.Fatalf("shouldShutdownIdleWorkerForReadyTask second error: %v", err)
+	}
+	if second {
+		t.Fatal("expected second idle worker not to evict for the same reserved READY task")
+	}
+}
+
+func TestWriteAgentInputResetsActivityIdleClock(t *testing.T) {
+	newIdleWorker := func(instanceID string) *worker {
+		w := &worker{
+			instanceID:     instanceID,
+			taskID:         "running-task",
+			agentID:        "agent-1",
+			usesPTY:        true,
+			runtimeCommand: "gemini --model auto",
+			input:          nopWriteCloser{Writer: &bytes.Buffer{}},
+			outputBuffer:   &outputRingBuffer{maxSize: 4096},
+			terminalState:  newVTScreenState(80, 24),
+			startedAt:      time.Now().Add(-workerIdleShutdownThreshold - time.Second),
+			done:           make(chan struct{}),
+		}
+		w.livestreamReady.Store(true)
+		w.bootstrapObserved.Store(true)
+		w.bootstrapReadyEmptySeen.Store(true)
+		return w
+	}
+	newReadyWorkManager := func(w *worker) *manager {
+		return &manager{
+			cfg:             config{UserJWT: "user-jwt", MaxConcurrent: 1, MBPerAgent: 1024},
+			workers:         map[string]*worker{w.instanceID: w},
+			reservedTaskIDs: map[string]struct{}{},
+			state:           persistedState{ManagerID: "manager-1", Instances: map[string]persistedWorker{w.instanceID: {Status: "idle"}}},
+			client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/managers/tasks/agent-personas":
+					return jsonHTTPResponse(200, `[{"id":"agent-1","name":"Agent","runtime_id":"runtime-1"}]`), nil
+				case r.Method == http.MethodPost && r.URL.Path == "/managers/tasks/eligible":
+					return jsonHTTPResponse(200, `[{"id":"ready-task","name":"Ready task","status":"READY","eligible_agent_ids":["agent-1"]}]`), nil
+				default:
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+					return nil, nil
+				}
+			})},
+		}
+	}
+
+	controlWorker := newIdleWorker("control-instance")
+	controlManager := newReadyWorkManager(controlWorker)
+	controlManager.checkWorkerIdleTimeout(controlWorker)
+	if shutdownRequested, _, shutdownMode := controlWorker.shutdownRequestDetails(); !shutdownRequested || shutdownMode != shutdownModeIdleTimeout {
+		t.Fatalf("expected stale worker to shut down before user input, requested=%t mode=%q", shutdownRequested, shutdownMode)
+	}
+
+	var input bytes.Buffer
+	w := newIdleWorker("instance-1")
+	w.input = nopWriteCloser{Writer: &input}
+
+	mgr := newReadyWorkManager(w)
+	if err := mgr.writeAgentInputWithOptions(w, "hello", false, false); err != nil {
+		t.Fatalf("writeAgentInputWithOptions error: %v", err)
+	}
+	mgr.checkWorkerIdleTimeout(w)
+
+	if shutdownRequested, _, shutdownMode := w.shutdownRequestDetails(); shutdownRequested {
+		t.Fatalf("expected user input to reset idle timeout, requested=%t mode=%q", shutdownRequested, shutdownMode)
 	}
 }
 
@@ -2713,6 +3042,8 @@ func TestEnsureSupabaseBootstrapFallsBackToAPIClientConfigWhenRootReturnsHTML(t 
 }
 
 func TestLoginKeepsSessionWhenManagerRegistrationFails(t *testing.T) {
+	disableBrowserOpenForTest(t)
+
 	originalKeyringSet := keyringSet
 	originalKeyringGet := keyringGet
 	originalSignalManagedPIDFunc := signalManagedPIDFunc
@@ -2773,6 +3104,11 @@ func TestLoginKeepsSessionWhenManagerRegistrationFails(t *testing.T) {
 		t.Fatalf("writeState error: %v", err)
 	}
 
+	accessToken := mustTestJWT(t, jwt.MapClaims{
+		"sub":   "user-123",
+		"email": "user@example.com",
+		"exp":   time.Now().Add(time.Hour).Unix(),
+	})
 	m.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/version/client-config":
@@ -2780,7 +3116,17 @@ func TestLoginKeepsSessionWhenManagerRegistrationFails(t *testing.T) {
 		case "/auth/init":
 			return jsonHTTPResponse(200, `{"shortId":"login-123"}`), nil
 		case "/auth/sessions/login-123/poll":
-			return jsonHTTPResponse(200, `{"pending":false,"accessToken":"access-token","refreshToken":"refresh-token","expiresAt":4070908800,"userId":"user-123"}`), nil
+			return jsonHTTPResponse(200, fmt.Sprintf(
+				`{"pending":false,"accessToken":%q,"refreshToken":"refresh-token","expiresAt":4070908800,"userId":"user-123"}`,
+				accessToken,
+			)), nil
+		case "/auth/v1/keys":
+			return jsonHTTPResponse(500, `{"message":"jwks unavailable in test"}`), nil
+		case "/auth/v1/user":
+			if got := r.Header.Get("Authorization"); got != "Bearer "+accessToken {
+				t.Fatalf("unexpected Supabase user auth header: %q", got)
+			}
+			return jsonHTTPResponse(200, `{"id":"user-123"}`), nil
 		case "/local-agent-managers/register":
 			return jsonHTTPResponse(400, `{"message":"Unable to create Cloudflare tunnel","error":"Bad Request","statusCode":400}`), nil
 		default:
@@ -2799,8 +3145,11 @@ func TestLoginKeepsSessionWhenManagerRegistrationFails(t *testing.T) {
 	if loadErr != nil {
 		t.Fatalf("loadSession error: %v", loadErr)
 	}
-	if session.AccessToken != "access-token" {
+	if session.AccessToken != accessToken {
 		t.Fatalf("expected saved access token, got %q", session.AccessToken)
+	}
+	if session.UserEmail != "user@example.com" {
+		t.Fatalf("expected saved user email user@example.com, got %q", session.UserEmail)
 	}
 	if !strings.Contains(output, "Authentication complete.") {
 		t.Fatalf("expected successful login output, got %q", output)
@@ -2813,7 +3162,77 @@ func TestLoginKeepsSessionWhenManagerRegistrationFails(t *testing.T) {
 	}
 }
 
+func TestLoginRejectsMalformedAccessToken(t *testing.T) {
+	disableBrowserOpenForTest(t)
+
+	originalKeyringSet := keyringSet
+	keyringSet = func(service, user, password string) error {
+		t.Fatalf("malformed login token must not be saved")
+		return nil
+	}
+	t.Cleanup(func() {
+		keyringSet = originalKeyringSet
+	})
+
+	originalStdin := os.Stdin
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe error: %v", err)
+	}
+	if _, err := writer.Write([]byte("\n")); err != nil {
+		t.Fatalf("stdin write error: %v", err)
+	}
+	_ = writer.Close()
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = originalStdin
+	})
+
+	tempDir := t.TempDir()
+	stateFile := filepath.Join(tempDir, "manager-state.json")
+	m, err := newManager(config{
+		APIBaseURL: "http://local.test",
+		WebBaseURL: "https://app.passiveagents.test",
+		StateFile:  stateFile,
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+
+	m.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/version/client-config":
+			return jsonHTTPResponse(200, `{"supabaseUrl":"http://local.test","supabaseAnonKey":"anon-key"}`), nil
+		case "/auth/init":
+			return jsonHTTPResponse(200, `{"shortId":"login-123"}`), nil
+		case "/auth/sessions/login-123/poll":
+			return jsonHTTPResponse(200, `{"pending":false,"accessToken":"not-a-jwt","refreshToken":"refresh-token","expiresAt":4070908800,"userId":"user-123"}`), nil
+		case "/auth/v1/keys":
+			return jsonHTTPResponse(500, `{"message":"jwks unavailable in test"}`), nil
+		case "/auth/v1/user":
+			if got := r.Header.Get("Authorization"); got != "Bearer not-a-jwt" {
+				t.Fatalf("unexpected Supabase user auth header: %q", got)
+			}
+			return jsonHTTPResponse(200, `{"id":"different-user"}`), nil
+		case "/local-agent-managers/register":
+			t.Fatalf("malformed login token must not register manager")
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("unexpected request path %s", r.URL.Path)
+		}
+	})}
+
+	_, err = captureStdout(t, func() error {
+		return m.login(context.Background())
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid access token") {
+		t.Fatalf("expected invalid access token error, got %v", err)
+	}
+}
+
 func TestLoginSyncsNewSessionToRegisteredManager(t *testing.T) {
+	disableBrowserOpenForTest(t)
+
 	originalKeyringSet := keyringSet
 	originalKeyringGet := keyringGet
 	var storedSessionRaw string
@@ -2866,6 +3285,11 @@ func TestLoginSyncsNewSessionToRegisteredManager(t *testing.T) {
 	}
 
 	sessionSyncCalls := 0
+	accessToken := mustTestJWT(t, jwt.MapClaims{
+		"sub":   "user-123",
+		"email": "user@example.com",
+		"exp":   time.Now().Add(time.Hour).Unix(),
+	})
 	m.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/version/client-config":
@@ -2873,13 +3297,23 @@ func TestLoginSyncsNewSessionToRegisteredManager(t *testing.T) {
 		case "/auth/init":
 			return jsonHTTPResponse(200, `{"shortId":"login-123"}`), nil
 		case "/auth/sessions/login-123/poll":
-			return jsonHTTPResponse(200, `{"pending":false,"accessToken":"access-token","refreshToken":"refresh-token","expiresAt":4070908800,"userId":"user-123"}`), nil
+			return jsonHTTPResponse(200, fmt.Sprintf(
+				`{"pending":false,"accessToken":%q,"refreshToken":"refresh-token","expiresAt":4070908800,"userId":"user-123"}`,
+				accessToken,
+			)), nil
+		case "/auth/v1/keys":
+			return jsonHTTPResponse(500, `{"message":"jwks unavailable in test"}`), nil
+		case "/auth/v1/user":
+			if got := r.Header.Get("Authorization"); got != "Bearer "+accessToken {
+				t.Fatalf("unexpected Supabase user auth header: %q", got)
+			}
+			return jsonHTTPResponse(200, `{"id":"user-123"}`), nil
 		case "/local-agent-managers/manager-1/session":
 			var payload map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 				t.Fatalf("decode session sync payload: %v", err)
 			}
-			if got := r.Header.Get("Authorization"); got != "Bearer access-token" {
+			if got := r.Header.Get("Authorization"); got != "Bearer "+accessToken {
 				t.Fatalf("unexpected session sync auth header: %q", got)
 			}
 			if got := payload["refreshToken"]; got != "refresh-token" {
@@ -4379,6 +4813,10 @@ func TestPollPendingReauthSessionStoresRotatedTokensAndClearsAuthRequired(t *tes
 		t.Fatalf("saveSession error: %v", err)
 	}
 
+	newAccess := mustTestJWT(t, jwt.MapClaims{
+		"sub": "user-1",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
 	pollCalls := 0
 	syncCalls := 0
 	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -4391,12 +4829,16 @@ func TestPollPendingReauthSessionStoresRotatedTokensAndClearsAuthRequired(t *tes
 				t.Fatalf("unexpected code verifier: %q", got)
 			}
 			pollCalls++
-			return jsonHTTPResponse(200, `{"pending":false,"accessToken":"new-access","refreshToken":"new-refresh","expiresAt":4102444800,"userId":"user-1"}`), nil
+			return jsonHTTPResponse(200, fmt.Sprintf(
+				`{"pending":false,"accessToken":%q,"refreshToken":"new-refresh","expiresAt":%d,"userId":"user-1"}`,
+				newAccess,
+				time.Now().Add(time.Hour).Unix(),
+			)), nil
 		case "/local-agent-managers/manager-1/session":
 			if r.Method != http.MethodPost {
 				t.Fatalf("unexpected sync method: %s", r.Method)
 			}
-			if got := r.Header.Get("Authorization"); got != "Bearer new-access" {
+			if got := r.Header.Get("Authorization"); got != "Bearer "+newAccess {
 				t.Fatalf("unexpected sync authorization header: %q", got)
 			}
 			var payload map[string]any
@@ -4412,14 +4854,17 @@ func TestPollPendingReauthSessionStoresRotatedTokensAndClearsAuthRequired(t *tes
 			if r.Method != http.MethodPatch {
 				t.Fatalf("unexpected heartbeat method: %s", r.Method)
 			}
-			if got := r.Header.Get("Authorization"); got != "Bearer new-access" {
+			if got := r.Header.Get("Authorization"); got != "Bearer "+newAccess {
 				t.Fatalf("unexpected heartbeat authorization header: %q", got)
 			}
 			return jsonHTTPResponse(200, `{"ok":true}`), nil
 		case "/auth/v1/keys":
 			return jsonHTTPResponse(500, `{"message":"jwks unavailable in test"}`), nil
 		case "/auth/v1/user":
-			return jsonHTTPResponse(401, `{"message":"user lookup unavailable in test"}`), nil
+			if got := r.Header.Get("Authorization"); got != "Bearer "+newAccess {
+				t.Fatalf("unexpected Supabase user auth header: %q", got)
+			}
+			return jsonHTTPResponse(200, `{"id":"user-1"}`), nil
 		default:
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 			return nil, nil
@@ -4452,7 +4897,7 @@ func TestPollPendingReauthSessionStoresRotatedTokensAndClearsAuthRequired(t *tes
 	if err != nil {
 		t.Fatalf("loadSession error: %v", err)
 	}
-	if session.AccessToken != "new-access" || session.RefreshToken != "new-refresh" {
+	if session.AccessToken != newAccess || session.RefreshToken != "new-refresh" {
 		t.Fatalf("expected rotated session to be stored, got %#v", session)
 	}
 
@@ -4471,8 +4916,76 @@ func TestPollPendingReauthSessionStoresRotatedTokensAndClearsAuthRequired(t *tes
 	if err != nil {
 		t.Fatalf("getFreshStoredSession error: %v", err)
 	}
-	if freshSession.AccessToken != "new-access" || freshSession.RefreshToken != "new-refresh" {
+	if freshSession.AccessToken != newAccess || freshSession.RefreshToken != "new-refresh" {
 		t.Fatalf("expected stored session to resume normal use, got %#v", freshSession)
+	}
+}
+
+func TestPollPendingReauthSessionRejectsMalformedAccessToken(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	stateFile := filepath.Join(tempHome, "manager-state.json")
+	mgr, err := newManager(config{
+		APIBaseURL:      "http://local.test",
+		SupabaseURL:     "http://supabase.test",
+		SupabaseAnonKey: "anon-key",
+		StateFile:       stateFile,
+		MachineName:     "regression-box",
+	})
+	if err != nil {
+		t.Fatalf("newManager error: %v", err)
+	}
+	mgr.state.ManagerID = "manager-1"
+	mgr.state.AuthRequired = true
+	mgr.state.ReauthSessionID = "login-123"
+	mgr.state.ReauthCodeVerifier = "verifier-123"
+	if err := writeState(stateFile, mgr.state); err != nil {
+		t.Fatalf("writeState error: %v", err)
+	}
+	if err := mgr.saveSession(storedSession{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    4102441200,
+		UserID:       "user-1",
+	}); err != nil {
+		t.Fatalf("saveSession error: %v", err)
+	}
+
+	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/auth/sessions/login-123/poll":
+			return jsonHTTPResponse(200, `{"pending":false,"accessToken":"not-a-jwt","refreshToken":"new-refresh","expiresAt":4102444800,"userId":"user-1"}`), nil
+		case "/auth/v1/keys":
+			return jsonHTTPResponse(500, `{"message":"jwks unavailable in test"}`), nil
+		case "/auth/v1/user":
+			if got := r.Header.Get("Authorization"); got != "Bearer not-a-jwt" {
+				t.Fatalf("unexpected Supabase user auth header: %q", got)
+			}
+			return jsonHTTPResponse(200, `{"id":"different-user"}`), nil
+		case "/local-agent-managers/manager-1/session":
+			t.Fatalf("malformed reauth token must not be synced to backend")
+			return nil, nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	err = mgr.pollPendingReauthSession(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "invalid access token") {
+		t.Fatalf("expected invalid access token error, got %v", err)
+	}
+
+	session, err := mgr.loadSession()
+	if err != nil {
+		t.Fatalf("loadSession error: %v", err)
+	}
+	if session.AccessToken != "old-access" || session.RefreshToken != "old-refresh" {
+		t.Fatalf("expected original session to remain stored, got %#v", session)
+	}
+	if !mgr.state.AuthRequired {
+		t.Fatal("expected auth_required to remain set")
 	}
 }
 
@@ -4604,12 +5117,25 @@ func TestPollPendingReauthSessionRejectsWrongAccountTokens(t *testing.T) {
 		t.Fatalf("saveSession error: %v", err)
 	}
 
+	wrongAccess := mustTestJWT(t, jwt.MapClaims{
+		"sub": "browser-user",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
 	mgr.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/auth/sessions/login-123/poll":
-			return jsonHTTPResponse(200, `{"pending":false,"accessToken":"wrong-access","refreshToken":"wrong-refresh","expiresAt":4102444800,"userId":"browser-user"}`), nil
+			return jsonHTTPResponse(200, fmt.Sprintf(
+				`{"pending":false,"accessToken":%q,"refreshToken":"wrong-refresh","expiresAt":%d,"userId":"browser-user"}`,
+				wrongAccess,
+				time.Now().Add(time.Hour).Unix(),
+			)), nil
 		case "/auth/v1/keys":
 			return jsonHTTPResponse(500, `{"message":"jwks unavailable in test"}`), nil
+		case "/auth/v1/user":
+			if got := r.Header.Get("Authorization"); got != "Bearer "+wrongAccess {
+				t.Fatalf("unexpected Supabase user auth header: %q", got)
+			}
+			return jsonHTTPResponse(200, `{"id":"browser-user"}`), nil
 		default:
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 			return nil, nil
@@ -6004,7 +6530,8 @@ func TestApplyBrowserTerminalInputWritesRawBytesToWorker(t *testing.T) {
 	mgr := &manager{
 		workers: map[string]*worker{
 			"instance-1": {
-				input: nopWriteCloser{Writer: &input},
+				input:     nopWriteCloser{Writer: &input},
+				startedAt: time.Now().Add(-workerIdleShutdownThreshold - time.Second),
 			},
 		},
 	}
@@ -6013,6 +6540,9 @@ func TestApplyBrowserTerminalInputWritesRawBytesToWorker(t *testing.T) {
 
 	if got := input.String(); got != "\x1bhello\r" {
 		t.Fatalf("unexpected raw terminal input: %q", got)
+	}
+	if lastActivityAt := mgr.workers["instance-1"].lastActivityOrStartAt(); time.Since(lastActivityAt) > time.Second {
+		t.Fatalf("expected browser terminal input to mark recent activity, got %s", lastActivityAt)
 	}
 }
 
@@ -6035,6 +6565,44 @@ func TestApplyBrowserTerminalInputAllowsPTYInputBeforeBootstrapObserved(t *testi
 	mgr.applyBrowserTerminalInput("instance-1", "typed")
 	if got := input.String(); got != "typed" {
 		t.Fatalf("expected PTY input to pass through before bootstrap observation, got %q", got)
+	}
+}
+
+func TestHandleAttachClientInputMarksActivity(t *testing.T) {
+	var input bytes.Buffer
+	w := &worker{
+		instanceID:     "instance-1",
+		input:          nopWriteCloser{Writer: &input},
+		terminalState:  newVTScreenState(80, 24),
+		attachClients:  map[net.Conn]struct{}{},
+		startedAt:      time.Now().Add(-workerIdleShutdownThreshold - time.Second),
+		runtimeCommand: "gemini --model auto",
+	}
+	mgr := &manager{}
+
+	server, client := net.Pipe()
+	w.attachClients[server] = struct{}{}
+	done := make(chan struct{})
+	go func() {
+		mgr.handleAttachClientInput(w, server)
+		close(done)
+	}()
+
+	if _, err := fmt.Fprintf(client, "%s 80 24\ntyped", attachHandshakePrefix); err != nil {
+		t.Fatalf("write attach input: %v", err)
+	}
+	_ = client.Close()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for attach input handler")
+	}
+	if got := input.String(); got != "typed" {
+		t.Fatalf("expected attach input to pass through, got %q", got)
+	}
+	if lastActivityAt := w.lastActivityOrStartAt(); time.Since(lastActivityAt) > time.Second {
+		t.Fatalf("expected attach input to mark recent activity, got %s", lastActivityAt)
 	}
 }
 
@@ -8100,6 +8668,21 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 		t.Fatalf("reading captured stdout: %v", readErr)
 	}
 	return string(output), runErr
+}
+
+func disableBrowserOpenForTest(t *testing.T) {
+	t.Helper()
+	originalShouldAttempt := shouldAttemptBrowserOpenFunc
+	originalTryOpen := tryOpenBrowserFunc
+	shouldAttemptBrowserOpenFunc = func() bool { return false }
+	tryOpenBrowserFunc = func(targetURL string) error {
+		t.Fatalf("login test must not open browser URL %q", targetURL)
+		return nil
+	}
+	t.Cleanup(func() {
+		shouldAttemptBrowserOpenFunc = originalShouldAttempt
+		tryOpenBrowserFunc = originalTryOpen
+	})
 }
 
 func startPassiveAgentsTestProcess(t *testing.T) *exec.Cmd {
